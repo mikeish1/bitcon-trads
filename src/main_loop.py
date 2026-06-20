@@ -31,6 +31,7 @@ from src.claude_orchestrator import ClaudeOrchestrator
 from src.config import load_config
 from src.data_pipeline import DataPipeline, build_exchange
 from src.executor import SpotExecutor
+from src.notifications import Notifier
 from src.risk_manager import RiskManager
 from src.strategy import Strategy
 
@@ -61,6 +62,8 @@ class TradingBot:
         self.strategy = Strategy(self.cfg, claude_orchestrator=self.claude)
         self.risk = RiskManager(self.cfg)
         self.executor = SpotExecutor(self.cfg, self.exchange)
+        self.notifier = Notifier(self.cfg)
+        self._mode = mode
 
         self.primary_tf = self.cfg["market"]["primary_timeframe"]
         self.poll_seconds = self.cfg["market"]["poll_seconds"]
@@ -68,6 +71,7 @@ class TradingBot:
         self.running = True
         self._last_candle_ts: Optional[Any] = None
         self._last_summary_day: Optional[str] = None
+        self._cb_notified = False  # circuit-breaker alert sent once per trip
 
         signal.signal(signal.SIGINT, self._sig)
         signal.signal(signal.SIGTERM, self._sig)
@@ -98,11 +102,15 @@ class TradingBot:
                     self.cfg["strategy"]["triggers"]["min_required"],
                     self.cfg["risk"]["risk_per_trade_pct"], self.cfg["risk"]["default_capital_usd"])
 
+        self.notifier.startup(self.cfg["runtime"]["exchange_id"],
+                              self.cfg["market"]["symbol"], self._mode)
+
         while self.running:
             try:
                 self._cycle()
             except Exception as exc:
                 logger.exception("Cycle error (continuing): {}", exc)
+                self.notifier.error(f"Cycle error (continuing): {exc}")
             self._sleep(self.poll_seconds)
 
         logger.info("Loop stopped.")
@@ -155,6 +163,9 @@ class TradingBot:
         allowed, why = self.risk.can_open_trade(equity)
         if not allowed:
             logger.info("BUY suppressed by safety rails: {}", why)
+            if "circuit breaker" in why and not self._cb_notified:
+                self.notifier.error(f"Circuit breaker active - trading paused. ({why})")
+                self._cb_notified = True
             return
 
         available_usdt = balances.get("USDT", 0.0) if self.cfg["runtime"]["uses_broker"] else equity
@@ -176,6 +187,9 @@ class TradingBot:
                   f"risk {sizing['risk_fraction']:.2%}")
         self.risk.record_open(fill, sizing["stop_price"], sizing["take_price"],
                               stop_order_id, reason)
+        self._cb_notified = False  # fresh trade -> re-arm circuit-breaker alert
+        self.notifier.entry(fill["price"], fill["qty"], fill["cost"],
+                            sizing["stop_price"], sizing["take_price"], reason)
 
     # ------------------------------------------------------------------ #
     def _manage(self, price: float, atr: float, balances: dict[str, float]) -> None:
@@ -223,8 +237,10 @@ class TradingBot:
         fill = self.executor.market_sell(pos["qty"], price, reason)
         if fill is None:
             logger.error("Exit sell failed - position left open, will retry next cycle.")
+            self.notifier.error("Exit sell FAILED - position still open, retrying next cycle.")
             return
-        self.risk.record_close(pos, fill["price"], fill.get("fee", 0.0), reason)
+        pnl = self.risk.record_close(pos, fill["price"], fill.get("fee", 0.0), reason)
+        self.notifier.exit(fill["price"], pnl, reason)
 
     # ------------------------------------------------------------------ #
     def _maybe_summary(self, candle_ts, equity: float) -> None:
@@ -234,7 +250,9 @@ class TradingBot:
             return
         self._last_summary_day = day
         stats = self.risk.daily_stats(equity)
-        logger.info("DAILY SUMMARY ({})\n{}\n{}", day, self.claude.daily_summary(stats), stats)
+        note = self.claude.daily_summary(stats)
+        logger.info("DAILY SUMMARY ({})\n{}\n{}", day, note, stats)
+        self.notifier.summary(stats, note)
 
 
 def main() -> None:

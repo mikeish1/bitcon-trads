@@ -90,6 +90,10 @@ def load_config() -> dict[str, Any]:
         "api_secret": api_secret,
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "db_path": os.getenv("DB_PATH", "trading_state.db"),
+        # Optional Telegram alerts (no-op unless token + chat id are set).
+        "telegram_enabled": _env_bool("TELEGRAM_ENABLED", True),
+        "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
     }
 
     # ---- Common overrides ----

@@ -193,6 +193,45 @@ limits, cooldown, max trades/day) until you fully understand them.
 
 ---
 
+## Telegram notifications (optional)
+
+Get a phone alert whenever the bot **buys**, **sells**, posts a **daily
+summary**, or trips a **circuit breaker / error**. Completely optional — if you
+don't set it up, the bot runs exactly the same, just without alerts.
+
+### 1. Create a free Telegram bot (2 minutes)
+1. In Telegram, search for **@BotFather** and open a chat with it.
+2. Send **`/newbot`**. Follow the prompts: give it a name and a username
+   (must end in `bot`, e.g. `my_btc_alerts_bot`).
+3. BotFather replies with a **token** that looks like
+   `123456789:AAExampleTokenStringHere`. Copy it — that's your `TELEGRAM_BOT_TOKEN`.
+
+### 2. Get your chat ID
+1. **Send any message** (e.g. "hi") to your new bot in Telegram first — a bot
+   can't message you until you've messaged it.
+2. In a browser, open (paste your token in place of `<TOKEN>`):
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`
+3. Look for `"chat":{"id":123456789,...}`. That number is your `TELEGRAM_CHAT_ID`.
+   (If it's empty, send your bot another message and refresh the page.)
+
+### 3. Turn it on
+**Locally** — add to your `.env`:
+```
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=123456789:AAExampleTokenStringHere
+TELEGRAM_CHAT_ID=123456789
+```
+**On Railway** — add the same three as **Variables** (Service → Variables tab).
+
+Restart the bot. The log will say **"Telegram notifications: ON"** and you'll get
+a "🤖 Trading bot started" message. To disable later, set `TELEGRAM_ENABLED=false`
+or just clear the token.
+
+> Your token/chat id are secrets — they live only in `.env` (git-ignored) or in
+> Railway Variables, never in the code.
+
+---
+
 ## FAQ
 
 **Why does it almost never trade?** That's the point — it only takes

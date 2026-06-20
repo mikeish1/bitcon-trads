@@ -481,6 +481,10 @@ def main() -> None:
     ap.add_argument("--capital", type=float, default=None, help="Starting USDT (default 250).")
     ap.add_argument("--exchange", type=str, default="auto", help="Data source: auto, okx, binanceus, ...")
     ap.add_argument("--symbol", type=str, default=None, help="Symbol, default BTC/USDT.")
+    ap.add_argument("--min-triggers", type=int, default=None,
+                    help="Override strategy.triggers.min_required (sensitivity test).")
+    ap.add_argument("--adx-min", type=float, default=None,
+                    help="Override strategy.gates.adx_min (sensitivity test).")
     args = ap.parse_args()
 
     logger.remove()
@@ -493,6 +497,14 @@ def main() -> None:
     cfg["runtime"]["db_path"] = tmp_db
     cfg["runtime"]["uses_broker"] = False
     cfg["runtime"]["real_money"] = False
+
+    # Sensitivity overrides (don't touch the YAML).
+    if args.min_triggers is not None:
+        cfg["strategy"]["triggers"]["min_required"] = args.min_triggers
+    if args.adx_min is not None:
+        cfg["strategy"]["gates"]["adx_min"] = args.adx_min
+    logger.info("Config: min_triggers={} adx_min={}",
+                cfg["strategy"]["triggers"]["min_required"], cfg["strategy"]["gates"]["adx_min"])
 
     capital = args.capital if args.capital else cfg["risk"]["default_capital_usd"]
 
