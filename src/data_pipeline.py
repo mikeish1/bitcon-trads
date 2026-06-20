@@ -87,6 +87,11 @@ class DataPipeline:
         """
         if not self.use_ws:
             return False
+        # The WebSocket stream URLs below are Binance.com-specific. For any other
+        # exchange (e.g. Binance.US) we simply poll, which is just as reliable.
+        if self.cfg["runtime"].get("exchange_id", "binance") != "binance":
+            logger.info("WebSocket only wired for binance.com; using polling for this exchange.")
+            return False
         try:
             import websocket  # noqa: F401  (websocket-client)
         except Exception:
@@ -239,29 +244,44 @@ class DataPipeline:
 # ---------------------------------------------------------------------- #
 def build_exchange(cfg: dict[str, Any]) -> ccxt.Exchange:
     """
-    Build a ccxt Binance USDT-perpetual client.
+    Build a ccxt exchange client.
 
-    - Paper trading -> Binance Futures TESTNET (set_sandbox_mode(True)).
-    - Live trading  -> Binance mainnet.
+    - exchange_id "binance"   -> Binance.com USDT-perpetual futures. Paper/testnet
+      uses the Futures TESTNET (set_sandbox_mode(True)).
+    - exchange_id "binanceus" -> Binance.US SPOT (no futures, no testnet). Used by
+      US residents, for whom binance.com is geo-blocked. Sandbox is never set.
+
     Public market data works even without API keys.
     """
     runtime = cfg["runtime"]
+    exchange_id = runtime.get("exchange_id", "binance")
+    is_us = exchange_id == "binanceus"
+
     params: dict[str, Any] = {
         "enableRateLimit": True,
-        "options": {"defaultType": "future"},
+        # Binance.US is spot-only; binance.com here trades USDT-perpetual futures.
+        "options": {"defaultType": "spot" if is_us else "future"},
     }
     if runtime["binance_api_key"]:
         params["apiKey"] = runtime["binance_api_key"]
         params["secret"] = runtime["binance_api_secret"]
 
-    exchange = ccxt.binance(params)
+    try:
+        exchange = getattr(ccxt, exchange_id)(params)
+    except AttributeError:
+        logger.warning("Unknown EXCHANGE_ID '{}'; falling back to binance.", exchange_id)
+        exchange = ccxt.binance(params)
+        is_us = False
 
-    use_testnet = runtime["paper_trading"] or runtime["binance_testnet"]
-    if use_testnet:
+    # Sandbox/testnet only exists for binance.com. Binance.US has none.
+    if not is_us and (runtime["paper_trading"] or runtime["binance_testnet"]):
         exchange.set_sandbox_mode(True)
-        logger.info("Exchange in SANDBOX/TESTNET mode (safe).")
+        logger.info("Exchange '{}' in SANDBOX/TESTNET mode (safe).", exchange_id)
+    elif runtime["paper_trading"]:
+        logger.info("Exchange '{}' using LIVE public data; trades are SIMULATED "
+                    "(paper mode).", exchange_id)
     else:
-        logger.warning("Exchange in LIVE MAINNET mode - real orders will be placed!")
+        logger.warning("Exchange '{}' in LIVE mode - real orders will be placed!", exchange_id)
 
     try:
         exchange.load_markets()

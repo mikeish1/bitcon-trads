@@ -4,6 +4,9 @@
 *.sqlite
 *.sqlite3
 
+# Backtest data + generated results (can be large; regenerate anytime)
+backtests/
+
 # Python
 __pycache__/
 *.pyc
