@@ -29,7 +29,10 @@ def _utcnow() -> datetime:
 class RiskManager:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
-        self.really_live = cfg["runtime"]["really_live"]
+        # uses_broker: read equity from the venue (Alpaca paper or any live).
+        # real_money: those funds are real (affects only labels/warnings).
+        self.uses_broker = cfg["runtime"]["uses_broker"]
+        self.real_money = cfg["runtime"]["real_money"]
         r, s, e = cfg["risk"], cfg["safety"], cfg["exits"]
 
         self.default_capital = r["default_capital_usd"]
@@ -118,8 +121,8 @@ class RiskManager:
     # Equity                                                            #
     # ------------------------------------------------------------------ #
     def current_equity(self, balances: dict[str, float], price: float) -> float:
-        """Live: real portfolio value (USDT + BTC). Paper: simulated equity."""
-        if self.really_live:
+        """Broker (Alpaca paper / live): real account value. Else: simulated equity."""
+        if self.uses_broker:
             return balances.get("USDT", 0.0) + balances.get("BTC", 0.0) * price
         return self._getf("paper_equity", self.default_capital)
 
@@ -199,8 +202,8 @@ class RiskManager:
         risk_amount = equity * risk_fraction
         spend = risk_amount * price / stop_distance
 
-        # In live mode we can't spend more USDT than we actually hold.
-        cap = available_usdt * self.max_position_pct if self.really_live else equity * self.max_position_pct
+        # With a real (or paper-broker) account we can't spend more cash than we hold.
+        cap = available_usdt * self.max_position_pct if self.uses_broker else equity * self.max_position_pct
         spend = min(spend, cap)
 
         take_price = price + self.take_profit_R * stop_distance
@@ -230,7 +233,7 @@ class RiskManager:
 
     def record_open(self, fill: dict[str, Any], stop_price: float, take_price: float,
                     stop_order_id: Optional[str], reason: str) -> int:
-        mode = "LIVE" if self.really_live else "PAPER"
+        mode = "LIVE" if self.real_money else "PAPER"
         cur = self.conn.execute(
             "INSERT INTO trades(opened_at, entry_price, qty, cost_usd, entry_fee, "
             "stop_price, take_price, current_stop, stop_order_id, status, mode, reason) "
@@ -257,7 +260,7 @@ class RiskManager:
             "status='CLOSED', reason=? WHERE id=?",
             (_utcnow().isoformat(), exit_price, exit_fee, pnl, reason, trade["id"]))
 
-        if not self.really_live:
+        if not self.uses_broker:
             self._set("paper_equity", self._getf("paper_equity") + pnl)
         self._set("last_close_ts", _utcnow().isoformat())
         if pnl >= 0:
@@ -281,8 +284,8 @@ class RiskManager:
     # Startup reconciliation                                             #
     # ------------------------------------------------------------------ #
     def reconcile(self, balances: dict[str, float], price: float) -> None:
-        """Compare the DB's idea of our position to real balances (live only)."""
-        if not self.really_live:
+        """Compare the DB's idea of our position to real balances (broker only)."""
+        if not self.uses_broker:
             return
         pos = self.open_position()
         btc = balances.get("BTC", 0.0)
@@ -309,7 +312,7 @@ class RiskManager:
             "WHERE status='CLOSED' AND substr(closed_at,1,10)=?", (today,)).fetchone()
         return {
             "date_utc": today,
-            "mode": "LIVE" if self.really_live else "PAPER",
+            "mode": "LIVE" if self.real_money else "PAPER",
             "equity": round(equity, 2),
             "day_return_pct": round((equity / day_start - 1) * 100, 2) if day_start else 0,
             "week_return_pct": round((equity / week_start - 1) * 100, 2) if week_start else 0,

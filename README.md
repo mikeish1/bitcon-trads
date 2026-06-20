@@ -45,6 +45,36 @@ Because the bar is so high, **it will stay flat most of the time. That is by des
 
 ---
 
+## Choosing a venue (`EXCHANGE_ID`)
+
+| `EXCHANGE_ID` | Symbol | Paper mode | Real money |
+|---|---|---|---|
+| `alpaca` *(recommended for testing)* | `BTC/USD` | **Real paper brokerage** — orders are actually placed on Alpaca's paper account (realistic fills, you can watch the account), no real money | `ALPACA_PAPER=false` + the two-key tripwire |
+| `binanceus` | `BTC/USDT` | Internal simulation (live prices, simulated fills) | the two-key tripwire |
+
+### Alpaca paper trading (the easy, safe way to test)
+
+1. Create a free account at **alpaca.markets** and open the **Paper** dashboard.
+2. Copy your **paper** API key + secret (Home → API Keys).
+3. *(Optional, recommended)* Set your paper account's cash to roughly the amount
+   you'd really trade (e.g. $250) so position sizes are realistic — Alpaca paper
+   starts at $100,000 by default, which makes the bot trade big. Sizing is
+   dynamic, so it scales to whatever your paper balance is.
+4. In `.env`:
+   ```
+   EXCHANGE_ID=alpaca
+   ALPACA_PAPER=true
+   ALPACA_API_KEY=your_key
+   ALPACA_API_SECRET=your_secret
+   ```
+5. Run `python -m src.main_loop`. The banner will say **PAPER-BROKER (Alpaca
+   paper)** and real (paper) orders will appear in your Alpaca dashboard.
+
+> Note: Alpaca crypto may not accept exchange-side stop orders; if so, the bot
+> logs that and protects the position with its **in-loop software stop** instead.
+
+---
+
 ## Project layout
 
 ```

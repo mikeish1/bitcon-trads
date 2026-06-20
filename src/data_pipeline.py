@@ -40,12 +40,31 @@ class DataPipeline:
     # ------------------------------------------------------------------ #
     @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, max=20))
     def _fetch(self, timeframe: str, limit: int) -> pd.DataFrame:
-        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        # Some venues (Alpaca) cap how many bars a single request returns and
+        # ignore `limit`, which starves higher timeframes of the ~200 bars
+        # EMA-200 needs. Page forward from an explicit `since` until we have
+        # enough history (or hit "now").
+        tf_ms = self.exchange.parse_timeframe(timeframe) * 1000
+        now_ms = self.exchange.milliseconds()
+        since = now_ms - tf_ms * (limit + 10)
+        rows: list[list] = []
+        for _ in range(20):  # hard cap on pages, just in case
+            batch = self.exchange.fetch_ohlcv(self.symbol, timeframe=timeframe,
+                                              since=since, limit=1000)
+            if not batch:
+                break
+            rows.extend(batch)
+            nxt = batch[-1][0] + tf_ms
+            if nxt <= since or batch[-1][0] >= now_ms or len(rows) >= limit + 10:
+                break
+            since = nxt
+
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         for col in ("open", "high", "low", "close", "volume"):
             df[col] = df[col].astype(float)
-        return df
+        return df.tail(limit).reset_index(drop=True)
 
     def get_frames(self) -> dict[str, pd.DataFrame]:
         """Return {timeframe: dataframe-with-indicators} for every timeframe."""
@@ -87,11 +106,12 @@ class DataPipeline:
         Return {'USDT': free_usdt, 'BTC': free_btc}. In paper mode (or if keys
         are missing) returns zeros - sizing then falls back to default capital.
         """
-        if not self.cfg["runtime"]["binance_api_key"]:
+        if not self.cfg["runtime"]["api_key"]:
             return {"USDT": 0.0, "BTC": 0.0}
         try:
             bal = self.exchange.fetch_balance()
-            base, quote = self.symbol.split("/")  # BTC, USDT
+            base, quote = self.symbol.split("/")  # e.g. BTC / USDT (or USD on Alpaca)
+            # Keys are generic labels: "USDT" = quote cash, "BTC" = base coin.
             return {
                 "USDT": float(bal.get(quote, {}).get("free", 0.0) or 0.0),
                 "BTC": float(bal.get(base, {}).get("free", 0.0) or 0.0),
@@ -109,27 +129,40 @@ class DataPipeline:
 # ---------------------------------------------------------------------- #
 def build_exchange(cfg: dict[str, Any]) -> ccxt.Exchange:
     """
-    Build a ccxt spot client (Binance.US by default).
-    Public market data works without API keys; keys are needed for balances
-    and (when really_live) order placement.
+    Build a ccxt client for the configured venue (Binance.US or Alpaca).
+    Public market data works without API keys; keys are needed for balances and
+    for placing orders.
     """
     runtime = cfg["runtime"]
     exchange_id = runtime.get("exchange_id", "binanceus")
-    params: dict[str, Any] = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
-    if runtime["binance_api_key"]:
-        params["apiKey"] = runtime["binance_api_key"]
-        params["secret"] = runtime["binance_api_secret"]
+    params: dict[str, Any] = {"enableRateLimit": True}
+    if exchange_id != "alpaca":
+        params["options"] = {"defaultType": "spot"}  # Binance.US spot
+    if runtime["api_key"]:
+        params["apiKey"] = runtime["api_key"]
+        params["secret"] = runtime["api_secret"]
 
     try:
         exchange = getattr(ccxt, exchange_id)(params)
     except AttributeError:
         logger.warning("Unknown EXCHANGE_ID '{}'; falling back to binanceus.", exchange_id)
         exchange = ccxt.binanceus(params)
+        exchange_id = "binanceus"
 
-    if runtime["really_live"]:
-        logger.warning("LIVE TRADING ENABLED on '{}' - REAL orders will be placed!", exchange_id)
+    if runtime["use_sandbox"]:
+        try:
+            exchange.set_sandbox_mode(True)  # Alpaca PAPER endpoint
+            logger.info("Sandbox/PAPER endpoint enabled for '{}'.", exchange_id)
+        except Exception as exc:
+            logger.warning("Sandbox mode unavailable for {}: {}", exchange_id, exc)
+
+    if runtime["real_money"]:
+        logger.warning("REAL-MONEY trading on '{}' - live orders will be placed!", exchange_id)
+    elif runtime["place_orders"]:
+        logger.info("PAPER-BROKER mode on '{}' - orders go to the PAPER endpoint "
+                    "(realistic fills, NO real money).", exchange_id)
     else:
-        logger.info("PAPER mode on '{}' - orders are simulated, no real money at risk.", exchange_id)
+        logger.info("SIMULATION mode on '{}' - orders are simulated internally.", exchange_id)
 
     try:
         exchange.load_markets()

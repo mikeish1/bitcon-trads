@@ -41,12 +41,18 @@ class TradingBot:
         self._configure_logging()
 
         rt = self.cfg["runtime"]
-        mode = "LIVE (REAL ORDERS)" if rt["really_live"] else "PAPER (simulated)"
+        if rt["real_money"]:
+            mode = "LIVE (REAL MONEY)"
+        elif rt["place_orders"]:
+            mode = "PAPER-BROKER (Alpaca paper - realistic fills, no real money)"
+        else:
+            mode = "PAPER (internal simulation)"
         logger.info("=" * 66)
-        logger.info("Binance.US Spot Long-Only Bot | mode = {}", mode)
-        if not rt["really_live"] and not rt["paper_trading"]:
+        logger.info("Spot Long-Only Bot | venue={} | symbol={} | mode={}",
+                    rt["exchange_id"], self.cfg["market"]["symbol"], mode)
+        if rt["exchange_id"] != "alpaca" and not rt["real_money"] and not rt["paper_trading"]:
             logger.warning("PAPER_TRADING=false but LIVE_TRADING_ENABLED=false -> still PAPER. "
-                           "Set BOTH switches to go live.")
+                           "Set BOTH to go live on Binance.US.")
         logger.info("=" * 66)
 
         self.exchange = build_exchange(self.cfg)
@@ -151,7 +157,7 @@ class TradingBot:
             logger.info("BUY suppressed by safety rails: {}", why)
             return
 
-        available_usdt = balances.get("USDT", 0.0) if self.cfg["runtime"]["really_live"] else equity
+        available_usdt = balances.get("USDT", 0.0) if self.cfg["runtime"]["uses_broker"] else equity
         sizing = self.risk.size_buy(equity, available_usdt, price, atr)
         if not sizing["viable"]:
             logger.info("BUY skipped: size ${:.2f} below minimum.", sizing["spend_usd"])
@@ -177,8 +183,8 @@ class TradingBot:
         if pos is None:
             return
 
-        # Live: if our BTC vanished, the exchange stop filled while we were busy/offline.
-        if self.cfg["runtime"]["really_live"]:
+        # Broker accounts: if our BTC vanished, the exchange stop filled meanwhile.
+        if self.cfg["runtime"]["uses_broker"]:
             dust = self.cfg["risk"]["min_notional_usd"] / price if price else 0
             if balances.get("BTC", 0.0) < dust and pos["qty"] > dust:
                 self.risk.record_close(pos, pos["current_stop"] or price, 0.0, "exchange stop filled")
@@ -190,7 +196,7 @@ class TradingBot:
         if atr > 0:
             new_trail = self.risk.trailing_stop(price, atr)
             if new_trail > current_stop * 1.001:  # meaningful move only, avoids churn
-                if self.cfg["runtime"]["really_live"] and self.use_exchange_stop:
+                if self.cfg["runtime"]["place_orders"] and self.use_exchange_stop:
                     self.executor.cancel(pos["stop_order_id"])
                     new_id = self.executor.place_stop_limit_sell(
                         pos["qty"], new_trail, self.risk.stop_limit_price(new_trail))
@@ -212,7 +218,7 @@ class TradingBot:
 
     def _exit(self, pos, price: float, reason: str) -> None:
         # Cancel any resting exchange stop before we market-sell (avoid a double sell).
-        if self.cfg["runtime"]["really_live"] and self.use_exchange_stop:
+        if self.cfg["runtime"]["place_orders"] and self.use_exchange_stop:
             self.executor.cancel(pos["stop_order_id"])
         fill = self.executor.market_sell(pos["qty"], price, reason)
         if fill is None:
