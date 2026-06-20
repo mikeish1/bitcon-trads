@@ -1,24 +1,19 @@
 """
-Data pipeline: market data + indicators.
+Data pipeline for Binance.US spot.
 
-Responsibilities
-----------------
-1. Connect to Binance via ccxt (testnet for paper, mainnet for live).
-2. Backfill historical 5-minute candles on startup.
-3. Stream new candles - WebSocket preferred, automatic polling fallback.
-4. Compute a rich set of technical indicators on the candle dataframe.
+- Builds a ccxt.binanceus client (spot).
+- Fetches candles for multiple timeframes (5m primary + 15m/1h confirmation).
+- Computes technical indicators on each timeframe.
+- Reads real account balances (USDT / BTC) for sizing + reconciliation.
 
-Everything here is read-only with respect to your account: it only fetches
-market data. Order placement lives in main_loop / risk_manager.
+Read-only with respect to your account except for `fetch_balance`. Order
+placement lives in executor.py.
 
-A basic user does not need to change anything in this file.
+A basic user does not need to change anything here.
 """
 from __future__ import annotations
 
-import json
-import threading
-import time
-from typing import Any, Optional
+from typing import Any
 
 import ccxt
 import pandas as pd
@@ -26,217 +21,87 @@ import ta
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Binance pushes klines for these intervals on this public stream symbol format.
-_WS_URL_MAINNET = "wss://stream.binance.com:9443/ws"
-_WS_URL_TESTNET = "wss://stream.binancefuture.com/ws"  # futures testnet stream
-
 
 class DataPipeline:
-    """Fetches candles and computes indicators for the ensemble."""
-
     def __init__(self, cfg: dict[str, Any], exchange: ccxt.Exchange):
         self.cfg = cfg
         self.exchange = exchange
         self.symbol = cfg["market"]["symbol"]
-        self.timeframe = cfg["market"]["timeframe"]
+        self.primary_tf = cfg["market"]["primary_timeframe"]
+        self.confirm_tfs = cfg["market"]["confirm_timeframes"]
         self.backfill = cfg["market"]["backfill_candles"]
-        self.use_ws = cfg["market"]["use_websocket"]
 
-        self._df: pd.DataFrame = pd.DataFrame()
-        self._lock = threading.Lock()
-        self._ws_thread: Optional[threading.Thread] = None
-        self._ws_alive = False
+    @property
+    def all_timeframes(self) -> list[str]:
+        return [self.primary_tf, *self.confirm_tfs]
 
     # ------------------------------------------------------------------ #
-    # Backfill                                                            #
-    # ------------------------------------------------------------------ #
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, max=30))
-    def backfill_history(self) -> pd.DataFrame:
-        """Load historical candles so indicators have enough warm-up data."""
-        logger.info(
-            "Backfilling {} {} candles for {}", self.backfill, self.timeframe, self.symbol
-        )
-        raw = self.exchange.fetch_ohlcv(
-            self.symbol, timeframe=self.timeframe, limit=self.backfill
-        )
-        df = self._to_dataframe(raw)
-        with self._lock:
-            self._df = df
-        logger.info("Backfill complete: {} candles loaded.", len(df))
-        return df
-
-    # ------------------------------------------------------------------ #
-    # Polling (always available)                                          #
+    # Candles                                                            #
     # ------------------------------------------------------------------ #
     @retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, max=20))
-    def poll_latest(self) -> pd.DataFrame:
-        """Fetch the most recent candles and merge into the working dataframe."""
-        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=self.timeframe, limit=5)
-        new = self._to_dataframe(raw)
-        with self._lock:
-            self._df = self._merge(self._df, new)
-            return self._df.copy()
-
-    # ------------------------------------------------------------------ #
-    # WebSocket (optional, with fallback)                                 #
-    # ------------------------------------------------------------------ #
-    def start_websocket(self) -> bool:
-        """
-        Start a background WebSocket listener for closed klines.
-        Returns True if it started, False if unavailable (caller should poll).
-        """
-        if not self.use_ws:
-            return False
-        # The WebSocket stream URLs below are Binance.com-specific. For any other
-        # exchange (e.g. Binance.US) we simply poll, which is just as reliable.
-        if self.cfg["runtime"].get("exchange_id", "binance") != "binance":
-            logger.info("WebSocket only wired for binance.com; using polling for this exchange.")
-            return False
-        try:
-            import websocket  # noqa: F401  (websocket-client)
-        except Exception:
-            logger.warning("websocket-client not installed; using polling instead.")
-            return False
-
-        try:
-            self._ws_alive = True
-            self._ws_thread = threading.Thread(target=self._ws_run, daemon=True)
-            self._ws_thread.start()
-            logger.info("WebSocket listener started (polling remains as a safety net).")
-            return True
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Could not start WebSocket ({}); falling back to polling.", exc)
-            self._ws_alive = False
-            return False
-
-    def _ws_run(self) -> None:  # pragma: no cover - network thread
-        import websocket
-
-        testnet = self.cfg["runtime"]["binance_testnet"]
-        base = _WS_URL_TESTNET if testnet else _WS_URL_MAINNET
-        stream_symbol = self.symbol.replace("/", "").lower()
-        url = f"{base}/{stream_symbol}@kline_{self.timeframe}"
-
-        def on_message(_ws, message: str) -> None:
-            try:
-                data = json.loads(message)
-                k = data.get("k", {})
-                if not k.get("x"):  # only act on CLOSED candles
-                    return
-                candle = [[
-                    int(k["t"]),
-                    float(k["o"]),
-                    float(k["h"]),
-                    float(k["l"]),
-                    float(k["c"]),
-                    float(k["v"]),
-                ]]
-                new = self._to_dataframe(candle)
-                with self._lock:
-                    self._df = self._merge(self._df, new)
-                logger.debug("WS closed candle merged @ {}", k["c"])
-            except Exception as exc:
-                logger.warning("WS message parse error: {}", exc)
-
-        def on_error(_ws, error) -> None:
-            logger.warning("WebSocket error: {}", error)
-
-        def on_close(_ws, *_args) -> None:
-            logger.warning("WebSocket closed; polling will keep data fresh.")
-            self._ws_alive = False
-
-        while self._ws_alive:
-            try:
-                ws = websocket.WebSocketApp(
-                    url, on_message=on_message, on_error=on_error, on_close=on_close
-                )
-                ws.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception as exc:
-                logger.warning("WebSocket loop crashed ({}); retrying in 5s.", exc)
-            time.sleep(5)
-
-    def websocket_alive(self) -> bool:
-        return self._ws_alive
-
-    # ------------------------------------------------------------------ #
-    # Indicators                                                          #
-    # ------------------------------------------------------------------ #
-    def get_dataframe_with_indicators(self) -> pd.DataFrame:
-        """Return the current candles enriched with technical indicators."""
-        with self._lock:
-            df = self._df.copy()
-        return self.add_indicators(df)
-
-    @staticmethod
-    def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        """Compute the indicators the ensemble voters rely on."""
-        if len(df) < 60:
-            return df  # not enough warm-up data yet
-
-        close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
-
-        # Trend - EMAs across several lengths (parameter variation for voters).
-        for span in (5, 8, 13, 21, 34, 55, 89, 100, 200):
-            df[f"ema_{span}"] = ta.trend.ema_indicator(close, window=span)
-
-        # Momentum
-        for window in (7, 14, 21):
-            df[f"rsi_{window}"] = ta.momentum.rsi(close, window=window)
-        macd = ta.trend.MACD(close)
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        df["macd_diff"] = macd.macd_diff()
-        stoch = ta.momentum.StochasticOscillator(high, low, close)
-        df["stoch_k"] = stoch.stoch()
-        df["stoch_d"] = stoch.stoch_signal()
-        for window in (5, 10, 20):
-            df[f"roc_{window}"] = ta.momentum.roc(close, window=window)
-        df["willr"] = ta.momentum.williams_r(high, low, close)
-        df["cci"] = ta.trend.cci(high, low, close, window=20)
-
-        # Volatility / bands
-        bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
-        df["bb_high"] = bb.bollinger_hband()
-        df["bb_low"] = bb.bollinger_lband()
-        df["bb_mid"] = bb.bollinger_mavg()
-        df["atr"] = ta.volatility.average_true_range(high, low, close, window=14)
-
-        # Trend strength
-        adx = ta.trend.ADXIndicator(high, low, close, window=14)
-        df["adx"] = adx.adx()
-        df["adx_pos"] = adx.adx_pos()
-        df["adx_neg"] = adx.adx_neg()
-
-        # Volume confirmation
-        df["obv"] = ta.volume.on_balance_volume(close, vol)
-        df["obv_ema"] = ta.trend.ema_indicator(df["obv"], window=21)
-        df["vol_ema"] = ta.trend.ema_indicator(vol, window=20)
-
-        return df
-
-    # ------------------------------------------------------------------ #
-    # Helpers                                                             #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _to_dataframe(raw: list[list]) -> pd.DataFrame:
-        df = pd.DataFrame(
-            raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
-        )
+    def _fetch(self, timeframe: str, limit: int) -> pd.DataFrame:
+        raw = self.exchange.fetch_ohlcv(self.symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         for col in ("open", "high", "low", "close", "volume"):
             df[col] = df[col].astype(float)
         return df
 
+    def get_frames(self) -> dict[str, pd.DataFrame]:
+        """Return {timeframe: dataframe-with-indicators} for every timeframe."""
+        frames: dict[str, pd.DataFrame] = {}
+        for tf in self.all_timeframes:
+            df = self._fetch(tf, self.backfill)
+            frames[tf] = self.add_indicators(df)
+        return frames
+
     @staticmethod
-    def _merge(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
-        if old.empty:
-            combined = new
-        else:
-            combined = pd.concat([old, new], ignore_index=True)
-        combined = combined.drop_duplicates(subset="timestamp", keep="last")
-        combined = combined.sort_values("timestamp").reset_index(drop=True)
-        # Keep memory bounded.
-        return combined.tail(1000).reset_index(drop=True)
+    def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """Compute indicators used by the gates, triggers, vetoes and exits."""
+        if len(df) < 60:
+            return df
+        close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
+
+        for span in (21, 50, 200):
+            df[f"ema_{span}"] = ta.trend.ema_indicator(close, window=span)
+        df["rsi"] = ta.momentum.rsi(close, window=14)
+        macd = ta.trend.MACD(close)
+        df["macd_diff"] = macd.macd_diff()
+        stoch = ta.momentum.StochasticOscillator(high, low, close)
+        df["stoch_k"] = stoch.stoch()
+        df["stoch_d"] = stoch.stoch_signal()
+        df["roc_5"] = ta.momentum.roc(close, window=5)
+        adx = ta.trend.ADXIndicator(high, low, close, window=14)
+        df["adx"] = adx.adx()
+        df["adx_pos"] = adx.adx_pos()
+        df["adx_neg"] = adx.adx_neg()
+        df["atr"] = ta.volatility.average_true_range(high, low, close, window=14)
+        df["vol_ema"] = ta.trend.ema_indicator(vol, window=20)
+        return df
+
+    # ------------------------------------------------------------------ #
+    # Account balances                                                  #
+    # ------------------------------------------------------------------ #
+    def fetch_balances(self) -> dict[str, float]:
+        """
+        Return {'USDT': free_usdt, 'BTC': free_btc}. In paper mode (or if keys
+        are missing) returns zeros - sizing then falls back to default capital.
+        """
+        if not self.cfg["runtime"]["binance_api_key"]:
+            return {"USDT": 0.0, "BTC": 0.0}
+        try:
+            bal = self.exchange.fetch_balance()
+            base, quote = self.symbol.split("/")  # BTC, USDT
+            return {
+                "USDT": float(bal.get(quote, {}).get("free", 0.0) or 0.0),
+                "BTC": float(bal.get(base, {}).get("free", 0.0) or 0.0),
+            }
+        except Exception as exc:
+            logger.warning("Could not fetch balances ({}); using defaults.", exc)
+            return {"USDT": 0.0, "BTC": 0.0}
+
+    def last_price(self, frames: dict[str, pd.DataFrame]) -> float:
+        return float(frames[self.primary_tf].iloc[-1]["close"])
 
 
 # ---------------------------------------------------------------------- #
@@ -244,24 +109,13 @@ class DataPipeline:
 # ---------------------------------------------------------------------- #
 def build_exchange(cfg: dict[str, Any]) -> ccxt.Exchange:
     """
-    Build a ccxt exchange client.
-
-    - exchange_id "binance"   -> Binance.com USDT-perpetual futures. Paper/testnet
-      uses the Futures TESTNET (set_sandbox_mode(True)).
-    - exchange_id "binanceus" -> Binance.US SPOT (no futures, no testnet). Used by
-      US residents, for whom binance.com is geo-blocked. Sandbox is never set.
-
-    Public market data works even without API keys.
+    Build a ccxt spot client (Binance.US by default).
+    Public market data works without API keys; keys are needed for balances
+    and (when really_live) order placement.
     """
     runtime = cfg["runtime"]
-    exchange_id = runtime.get("exchange_id", "binance")
-    is_us = exchange_id == "binanceus"
-
-    params: dict[str, Any] = {
-        "enableRateLimit": True,
-        # Binance.US is spot-only; binance.com here trades USDT-perpetual futures.
-        "options": {"defaultType": "spot" if is_us else "future"},
-    }
+    exchange_id = runtime.get("exchange_id", "binanceus")
+    params: dict[str, Any] = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
     if runtime["binance_api_key"]:
         params["apiKey"] = runtime["binance_api_key"]
         params["secret"] = runtime["binance_api_secret"]
@@ -269,22 +123,16 @@ def build_exchange(cfg: dict[str, Any]) -> ccxt.Exchange:
     try:
         exchange = getattr(ccxt, exchange_id)(params)
     except AttributeError:
-        logger.warning("Unknown EXCHANGE_ID '{}'; falling back to binance.", exchange_id)
-        exchange = ccxt.binance(params)
-        is_us = False
+        logger.warning("Unknown EXCHANGE_ID '{}'; falling back to binanceus.", exchange_id)
+        exchange = ccxt.binanceus(params)
 
-    # Sandbox/testnet only exists for binance.com. Binance.US has none.
-    if not is_us and (runtime["paper_trading"] or runtime["binance_testnet"]):
-        exchange.set_sandbox_mode(True)
-        logger.info("Exchange '{}' in SANDBOX/TESTNET mode (safe).", exchange_id)
-    elif runtime["paper_trading"]:
-        logger.info("Exchange '{}' using LIVE public data; trades are SIMULATED "
-                    "(paper mode).", exchange_id)
+    if runtime["really_live"]:
+        logger.warning("LIVE TRADING ENABLED on '{}' - REAL orders will be placed!", exchange_id)
     else:
-        logger.warning("Exchange '{}' in LIVE mode - real orders will be placed!", exchange_id)
+        logger.info("PAPER mode on '{}' - orders are simulated, no real money at risk.", exchange_id)
 
     try:
         exchange.load_markets()
     except Exception as exc:  # pragma: no cover - network
-        logger.warning("Could not preload markets ({}); will retry on first fetch.", exc)
+        logger.warning("Could not preload markets ({}); will retry on first call.", exc)
     return exchange

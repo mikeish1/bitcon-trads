@@ -1,13 +1,11 @@
-# ---- Core trading system dependencies ----
-# Pinned to known-good versions so Railway builds are reproducible.
-
-ccxt==4.4.55            # Binance market data + order execution (testnet + mainnet)
-pandas==2.2.3           # Candle dataframes
-numpy==2.1.3            # Numerical helpers
-ta==0.11.0              # Technical-analysis indicators (pure python, no TA-Lib needed)
-anthropic==0.69.0       # Claude API (borderline-case validation + daily summaries)
-loguru==0.7.2           # Clean, colourful logging (renders nicely in Railway logs)
-PyYAML==6.0.2           # Reads config/trading_config.yaml
-python-dotenv==1.0.1    # Loads .env when running locally
-websocket-client==1.8.0 # Optional Binance WebSocket stream (polling is the fallback)
-tenacity==9.0.0         # Retry/backoff for flaky network calls
+# Core dependencies. Lower bounds (not hard pins) so they install cleanly across
+# recent Python versions.
+ccxt>=4.4,<5            # Binance.US spot data + order execution
+pandas>=2.2             # candle dataframes
+numpy>=1.26             # numerical helpers
+ta>=0.11                # technical indicators (pure python)
+anthropic>=0.69         # Claude API (sparing borderline validation + summaries)
+loguru>=0.7             # clean logging (renders nicely in Railway)
+PyYAML>=6.0             # reads config/trading_config.yaml
+python-dotenv>=1.0      # loads .env locally
+tenacity>=9.0           # retry/backoff for flaky network calls

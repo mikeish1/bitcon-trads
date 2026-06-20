@@ -1,173 +1,180 @@
-# 🪙 Bitcoin Ensemble Trading System
+# 🪙 Binance.US Spot — High-Conviction Long-Only BTC Bot
 
-An autonomous, **conservative** Bitcoin (BTC/USDT) trading bot that only acts
-when an ensemble of **31 independent prediction paths** strongly agrees. It runs
-as a single process, is designed to deploy on **Railway** in well under 2 hours,
-and **defaults to PAPER TRADING** (no real money) until you explicitly turn that
-off.
+An autonomous, **very conservative** Bitcoin bot for **Binance.US spot**. It buys
+BTC with USDT **only on high-conviction long setups** confirmed across multiple
+timeframes, protects every position with a stop, and otherwise **stays flat**.
 
-> ⚠️ **Risk warning.** Trading cryptocurrency can lose you money — potentially
-> all of it. This software is provided for educational purposes with no
-> guarantee of profit. **Start in paper mode. Use the Binance testnet. Never
-> trade money you cannot afford to lose.** You are solely responsible for any
-> live trades.
+It **defaults to PAPER mode** (simulated, no real money) and requires **two
+separate switches** to ever place a real order.
+
+> ⚠️ **Risk warning — read this.** Crypto trading can lose money, up to your
+> entire balance. This software has **no guarantee of profit**, may contain bugs,
+> and trades autonomously. **You are solely responsible for any real trades.**
+> Start in paper mode, test thoroughly, and never trade money you can't afford to
+> lose. Long-only spot means your worst case on an open trade is the asset going
+> to zero between stop checks — size accordingly.
 
 ---
 
-## How it works (plain English)
+## What it does (plain English)
 
-1. Every 5 minutes the bot pulls fresh BTC/USDT candles from Binance.
-2. **28 fast technical models** each vote LONG, SHORT, or stay FLAT.
-3. If those 28 are *almost* in agreement (a borderline 26–27), it asks
-   **3 Claude AI "experts"** to break the tie — that's the only time it calls
-   the AI, so it stays cheap.
-4. A trade only opens when **≥ 28 of the 31 paths agree**. Anything below 26 →
-   it does nothing.
-5. Position size uses **fractional Kelly** with conservative caps (≤ 1% risk per
-   trade by default).
-6. **Safety rails** stop trading after daily/weekly loss limits, a string of
-   losses, or during a cooldown — automatically.
-7. Once a day it writes a short plain-English summary to the logs.
+1. Every ~60 seconds it pulls BTC/USDT candles on **5m, 15m and 1h** from Binance.US.
+2. It only considers buying when **all** of these are true (the "gates"):
+   - **1h** is in a real uptrend (price above its 50 & 200 EMAs, ADX > 25, +DI > −DI)
+   - **15m** agrees (price above its 50 EMA)
+   - Market structure shows **higher highs and higher lows**
+3. Then it needs a **cluster of bullish triggers** on the 5m candle (RSI pullback
+   in the uptrend, MACD turning up, volume confirmation, pullback to a rising EMA,
+   etc.) — at least **6 of 8** must fire.
+4. Any **bearish veto** (overbought RSI, negative 1h momentum) cancels the setup.
+5. Optionally, **Claude** gives a final yes/no on borderline setups.
+6. On a buy it sizes the position **dynamically** (risk ~1% of equity, based on the
+   ATR stop distance), places an **exchange-side stop**, then **trails the stop up**
+   with ATR as price rises. It exits on the trailing stop or take-profit.
 
-Everything is logged with its reasoning, and all state lives in a small SQLite
-file so it survives restarts and redeploys.
+Because the bar is so high, **it will stay flat most of the time. That is by design.**
+
+---
+
+## Long-only, spot — what that means
+
+- It can only **buy BTC with USDT**, then later **sell BTC for USDT**. **No shorting.**
+- "Flat" = holding USDT. "In a trade" = holding BTC.
+- Binance.US is spot-only and has **no testnet**, so paper mode here uses **live
+  public prices with simulated fills** — realistic, but no real orders.
 
 ---
 
 ## Project layout
 
 ```
-.
-├── README.md
-├── requirements.txt
-├── Dockerfile
-├── .dockerignore
-├── .env.example
-├── config/
-│   └── trading_config.yaml      # all tunable settings (safe defaults)
-└── src/
-    ├── config.py                # loads YAML + env overrides
-    ├── data_pipeline.py         # Binance data + indicators (WS + polling)
-    ├── ensemble_engine.py       # the 31 prediction paths
-    ├── risk_manager.py          # Kelly sizing + safety rails + SQLite state
-    ├── claude_orchestrator.py   # Claude system prompt + helpers
-    └── main_loop.py             # the autonomous 5-minute heartbeat
+config/trading_config.yaml   # all tunable settings (safe defaults)
+src/config.py                # loads YAML + env vars
+src/data_pipeline.py         # Binance.US data (5m/15m/1h) + balances
+src/strategy.py              # the high-conviction long gate/trigger engine
+src/risk_manager.py          # dynamic sizing + ATR stops + safety rails + state
+src/executor.py              # Binance.US order placement (+ paper simulation)
+src/claude_orchestrator.py   # optional Claude yes/no + daily summary
+src/main_loop.py             # the autonomous heartbeat
+src/backtester.py            # (older long/short backtester — see note below)
 ```
 
----
-
-## What you need
-
-- A **Binance account**. For paper trading, create **Futures Testnet** keys at
-  <https://testnet.binancefuture.com/> (free, fake money).
-- An **Anthropic API key** from <https://console.anthropic.com/> (optional — if
-  omitted, borderline cases just resolve to "stay flat", the safe default).
-- A **Railway account** at <https://railway.app/> (for cloud deployment).
+> **Note:** `src/backtester.py` reflects the *previous* long/short logic, not the
+> new long-only rules. It still runs for rough exploration; a rebuild for the new
+> strategy is a planned separate step.
 
 ---
 
-## Run it locally (5 minutes)
+## Binance.US API key — exact requirements
+
+1. Log in at **binance.us** → profile → **API Management**.
+2. **Create API**, label it (e.g. `btc-bot`), complete 2FA/email verification.
+3. **Permissions:**
+   - ✅ **Enable Reading**
+   - ✅ **Enable Spot Trading**
+   - ❌ **Do NOT enable Withdrawals** — the bot never needs to move funds out.
+4. **Restrict access to your IP** (recommended, since you'll run it on your own PC):
+   add your home IP address. (Skip IP restriction only if running somewhere with a
+   changing IP, like Railway.)
+5. Copy the **API Key** and **Secret** — the secret is shown **only once**.
+
+Your account also needs some **USDT** to trade with.
+
+---
+
+## Run locally (paper mode — start here)
 
 ```bash
-# 1. Get the code into a folder, then create a virtual environment
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-# 2. Install dependencies
+.venv\Scripts\activate            # Windows  (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
 
-# 3. Create your settings file and edit it
-cp .env.example .env
-#   -> open .env and paste your keys. LEAVE PAPER_TRADING=true.
+copy .env.example .env            # macOS/Linux: cp .env.example .env
+#   -> edit .env: keep PAPER_TRADING=true and LIVE_TRADING_ENABLED=false.
+#      Add your Binance.US keys (optional in paper) and (optional) Anthropic key.
 
-# 4. Run the bot
 python -m src.main_loop
 ```
 
-You'll see it backfill candles, then print a decision roughly every 5 minutes.
-Press **Ctrl+C** to stop cleanly.
-
-The only thing a basic user ever needs to set is the values in `.env`. Deeper
-tuning lives in `config/trading_config.yaml`, which already has safe defaults.
+You'll see it load data, then print a decision each candle (usually "FLAT — gate
+failed", which is normal). Press **Ctrl+C** to stop.
 
 ---
 
-## Deploy on Railway (the easy path)
+## ✅ Testing protocol before going live (do not skip)
 
-1. Push this folder to a **GitHub repository** (private is fine).
-2. Go to <https://railway.app/> → **New Project** → **Deploy from GitHub repo**
-   and pick your repo. Railway detects the `Dockerfile` and builds it.
-3. Open the service → **Variables** tab → add these (click "New Variable" for
-   each), matching `.env.example`:
-
-   | Variable             | Value                                   |
-   | -------------------- | --------------------------------------- |
-   | `PAPER_TRADING`      | `true`  *(keep this until you trust it)* |
-   | `BINANCE_TESTNET`    | `true`                                   |
-   | `BINANCE_API_KEY`    | *your Binance **testnet** API key*       |
-   | `BINANCE_API_SECRET` | *your Binance **testnet** API secret*    |
-   | `ANTHROPIC_API_KEY`  | *your Anthropic key* (optional)          |
-   | `CLAUDE_MODEL`       | `claude-haiku-4-5` (optional)            |
-
-4. Railway redeploys automatically. Open the **Deploy logs / Logs** tab and
-   watch it run — you'll see backfill, then decisions every 5 minutes, and a
-   daily summary.
-
-That's it. The bot runs continuously. On every redeploy Railway sends a clean
-shutdown signal and the SQLite state file keeps your history.
-
-> 💡 **Persisting state across redeploys (optional but recommended):** add a
-> Railway **Volume** mounted at e.g. `/data`, then set `DB_PATH=/data/trading_state.db`
-> in Variables so your trade history isn't reset on each deploy.
+1. **Run paper mode for at least 1–2 weeks.** Read the logs daily. Confirm the
+   decisions and (simulated) entries/exits look sane.
+2. **Check it actually takes some trades.** If it never trades, loosen
+   `strategy.triggers.min_required` or `gates.adx_min` slightly in the YAML and
+   keep testing in paper.
+3. **Verify balances + permissions** with keys added (still paper): the startup log
+   should read your real balance without errors.
+4. **First live run = tiny.** Set `DEFAULT_CAPITAL_USD` low and keep only a small
+   USDT amount on the account. Watch the very first real buy and its stop order
+   appear on Binance.US.
+5. Only scale up once you've seen a full **buy → trail → exit** cycle behave
+   correctly with real (small) money.
 
 ---
 
-## Going live (only when you're ready)
+## Going live (only after the protocol above)
 
-You should run in paper mode for a good while first and review the logs. When —
-and only when — you fully understand and trust the behaviour:
+Real orders need **BOTH** switches flipped:
 
-1. Replace the testnet keys with your **real** Binance API keys.
-2. Set `BINANCE_TESTNET=false`.
-3. Set `PAPER_TRADING=false`.
-4. Start small. Lower `STARTING_CAPITAL_USD` / position caps if you want.
+```
+PAPER_TRADING=false
+LIVE_TRADING_ENABLED=true
+```
 
-Going live places **real orders with real money**. Re-read the risk warning
-above. The conservative defaults (1% risk per trade, 0.25 Kelly, 3% daily loss
-limit) are there to protect you — don't loosen them until you know why.
+Either one alone keeps you in paper mode — this is a deliberate two-key safety
+tripwire. When live, the startup banner will say **"LIVE (REAL ORDERS)"**.
+
+Keep the conservative defaults (1% risk/trade, ATR stops, daily/weekly loss
+limits, cooldown, max trades/day) until you fully understand them.
 
 ---
 
-## Tuning (advanced, optional)
+## Deploy on Railway
 
-Open `config/trading_config.yaml`. The most relevant knobs:
+1. Push this repo to **GitHub** (private recommended).
+2. Railway → **New Project → Deploy from GitHub repo** → pick the repo (it builds
+   the `Dockerfile`).
+3. Service → **Variables** → add:
 
-- `ensemble.trade_threshold` (default 28) — how many of 31 must agree to trade.
-- `risk.max_risk_per_trade` (default 0.01) — hard cap on risk per trade.
-- `risk.kelly_fraction` (default 0.25) — how aggressive position sizing is.
-- `safety.daily_loss_limit_pct` / `weekly_loss_limit_pct` — auto-stop levels.
-- `safety.cooldown_minutes` — pause after each closed trade.
+   | Variable | Value |
+   |---|---|
+   | `EXCHANGE_ID` | `binanceus` |
+   | `PAPER_TRADING` | `true` *(keep until fully trusted)* |
+   | `LIVE_TRADING_ENABLED` | `false` |
+   | `BINANCE_API_KEY` | *(your key)* |
+   | `BINANCE_API_SECRET` | *(your secret)* |
+   | `ANTHROPIC_API_KEY` | *(optional)* |
+   | `DEFAULT_CAPITAL_USD` | `250` |
 
-Any of these can also be set as environment variables (see `.env.example`),
-which always override the YAML.
+4. *(Recommended)* Add a **Volume** mounted at `/data` and set
+   `DB_PATH=/data/trading_state.db` so your trade history survives redeploys.
+5. Watch the **Logs** tab.
+
+> ⚠️ **Railway + API key IP restriction:** Railway's outbound IP changes, so you
+> generally **cannot** IP-restrict the key there. If you go live on Railway, rely
+> on the **no-withdrawal** permission as your protection. For tighter control,
+> run live on your own PC with an IP-restricted key instead.
 
 ---
 
 ## FAQ
 
-**Does it need the Claude API?** No. Without `ANTHROPIC_API_KEY`, borderline
-ties simply resolve to "stay flat", which is the safe choice. You just lose the
-tie-break nuance and the daily summary.
+**Why does it almost never trade?** That's the point — it only takes
+high-conviction, multi-timeframe-confirmed pullbacks in an uptrend. Long flat
+stretches are expected.
 
-**How often does it call Claude?** Only when the 28 technical models land in the
-marginal 26–27 zone — typically a small fraction of candles. The default model
-is the inexpensive `claude-haiku-4-5`.
+**Does it need Claude?** No. Without `ANTHROPIC_API_KEY`, borderline setups simply
+proceed on the rule engine, and you get no daily summary. Everything else works.
 
-**Will it trade a lot?** No — by design it stays flat unless agreement is
-extremely high. Long quiet stretches are normal and intended.
+**What protects me if my PC/Railway goes down mid-trade?** Live buys place an
+**exchange-side stop-limit** that stays active on Binance.US even if the bot is
+offline. The trailing (ratcheting the stop upward) only happens while the bot runs.
 
-**Where are my trades recorded?** In the SQLite file at `DB_PATH`
-(`trading_state.db` by default): tables `trades`, `decisions`, and `state`.
+**Where are my trades recorded?** In the SQLite file at `DB_PATH` — tables
+`trades`, `decisions`, `state`.

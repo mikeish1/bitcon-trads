@@ -1,12 +1,12 @@
 """
 Configuration loader.
 
-Reads config/trading_config.yaml, then lets environment variables override the
-handful of settings a user is most likely to want to change quickly. This keeps
-all secrets and "flip-it-fast" settings in env vars (Railway-friendly) while
-the bulk of the tuning lives in one readable YAML file.
+Reads config/trading_config.yaml, then applies environment-variable overrides
+for secrets and the live-trading switches. All secrets and "flip-it-fast"
+settings live in env vars (.env locally, or Railway variables) so nothing
+sensitive is ever committed.
 
-A basic user should not need to edit this file.
+A basic user only edits .env. Deeper tuning lives in the YAML.
 """
 from __future__ import annotations
 
@@ -17,8 +17,7 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-# Load a local .env if present (no-op on Railway, where vars come from the dashboard).
-load_dotenv()
+load_dotenv()  # load a local .env if present (no-op on Railway)
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "trading_config.yaml"
 
@@ -41,33 +40,34 @@ def _env_float(name: str, default: float) -> float:
 
 
 def load_config() -> dict[str, Any]:
-    """Load YAML config and apply environment-variable overrides."""
     with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
         cfg: dict[str, Any] = yaml.safe_load(fh)
 
-    # ---- Secrets & runtime mode (env only) ----
+    # ---- Runtime mode + secrets (env only) ----
+    paper = _env_bool("PAPER_TRADING", True)
+    live_enabled = _env_bool("LIVE_TRADING_ENABLED", False)
+    # The two-key tripwire: real orders ONLY when paper is off AND live is on.
+    really_live = (not paper) and live_enabled
+
     cfg["runtime"] = {
-        "paper_trading": _env_bool("PAPER_TRADING", True),
-        # Which exchange to use: "binance" (binance.com, futures) or
-        # "binanceus" (Binance.US, spot - required for US users).
-        "exchange_id": os.getenv("EXCHANGE_ID", "binance").strip().lower(),
+        "paper_trading": paper,
+        "live_trading_enabled": live_enabled,
+        "really_live": really_live,
+        # Spot-only refactor defaults to Binance.US.
+        "exchange_id": os.getenv("EXCHANGE_ID", "binanceus").strip().lower(),
         "binance_api_key": os.getenv("BINANCE_API_KEY", ""),
         "binance_api_secret": os.getenv("BINANCE_API_SECRET", ""),
-        "binance_testnet": _env_bool("BINANCE_TESTNET", True),
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "db_path": os.getenv("DB_PATH", "trading_state.db"),
     }
 
-    # ---- Optional overrides for common knobs ----
+    # ---- Common overrides ----
     cfg["claude"]["model"] = os.getenv("CLAUDE_MODEL", cfg["claude"]["model"])
-    cfg["risk"]["starting_capital_usd"] = _env_float(
-        "STARTING_CAPITAL_USD", cfg["risk"]["starting_capital_usd"]
+    cfg["risk"]["default_capital_usd"] = _env_float(
+        "DEFAULT_CAPITAL_USD", cfg["risk"]["default_capital_usd"]
     )
-    cfg["risk"]["max_risk_per_trade"] = _env_float(
-        "MAX_RISK_PER_TRADE", cfg["risk"]["max_risk_per_trade"]
-    )
-    cfg["risk"]["kelly_fraction"] = _env_float(
-        "KELLY_FRACTION", cfg["risk"]["kelly_fraction"]
+    cfg["risk"]["risk_per_trade_pct"] = _env_float(
+        "RISK_PER_TRADE_PCT", cfg["risk"]["risk_per_trade_pct"]
     )
     cfg["safety"]["daily_loss_limit_pct"] = _env_float(
         "DAILY_LOSS_LIMIT_PCT", cfg["safety"]["daily_loss_limit_pct"]
