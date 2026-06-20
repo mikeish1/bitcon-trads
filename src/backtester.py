@@ -78,31 +78,41 @@ DEFAULT_CSV = os.path.join(BACKTEST_DIR, "BTCUSDT_5m.csv")
 # --------------------------------------------------------------------------- #
 # Data loading                                                                #
 # --------------------------------------------------------------------------- #
-def download_history(symbol: str, timeframe: str, years: float) -> pd.DataFrame:
-    """
-    Download `years` of OHLCV candles from Binance (public spot data, no keys).
-    Paginates in 1000-candle chunks. This can take a couple of minutes the first
-    time - that's normal. Results are cached to CSV afterwards.
-    """
-    exchange = ccxt.binance({"enableRateLimit": True})
+# Reachable data sources, tried in order when --exchange is "auto".
+# binance.com is geo-blocked in some regions (e.g. the US -> HTTP 451), so we
+# fall back to mirrors that carry the same 5-minute history.
+def _fallback_sources(symbol: str) -> list[tuple[str, str]]:
+    btc_usd = "BTC/USD" if symbol.upper().startswith("BTC") else symbol
+    return [
+        ("binance", symbol),     # best history; often blocked in the US
+        ("binanceus", symbol),   # US-friendly mirror, same BTC/USDT symbol
+        ("okx", symbol),
+        ("kraken", symbol),
+        ("coinbase", btc_usd),   # BTC/USD (USDT not listed) - close enough
+    ]
+
+
+def _paginate(exchange, symbol: str, timeframe: str, years: float) -> pd.DataFrame:
+    """Page forward `years` of candles in chunks. Pure fetch; caches nothing."""
     tf_ms = exchange.parse_timeframe(timeframe) * 1000
     now_ms = exchange.milliseconds()
     since = now_ms - int(years * 365 * 24 * 60 * 60 * 1000)
 
-    logger.info("Downloading ~{} years of {} {} candles from Binance...", years, symbol, timeframe)
     rows: list[list] = []
     while since < now_ms:
         try:
             batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
         except Exception as exc:
-            logger.warning("Fetch hiccup ({}); retrying in 3s...", exc)
+            logger.warning("Fetch hiccup ({}); retrying in 3s...", str(exc).splitlines()[0][:80])
             time.sleep(3)
             continue
         if not batch:
             break
         rows.extend(batch)
-        since = batch[-1][0] + tf_ms
-        # Light progress + rate-limit courtesy.
+        nxt = batch[-1][0] + tf_ms
+        if nxt <= since:           # no forward progress -> stop (avoid infinite loop)
+            break
+        since = nxt
         last_dt = datetime.fromtimestamp(batch[-1][0] / 1000, tz=timezone.utc)
         print(f"  ...{len(rows):>8,} candles (up to {last_dt:%Y-%m-%d})", end="\r")
         time.sleep(exchange.rateLimit / 1000)
@@ -113,8 +123,36 @@ def download_history(symbol: str, timeframe: str, years: float) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = df[col].astype(float)
-    logger.info("Downloaded {} candles.", len(df))
     return df
+
+
+def download_history(symbol: str, timeframe: str, years: float,
+                     exchange_id: str = "auto") -> pd.DataFrame:
+    """
+    Download `years` of OHLCV candles (public data, no API keys).
+
+    If `exchange_id` is "auto", try a list of reachable exchanges and use the
+    first that responds (handy because binance.com is blocked in some regions,
+    e.g. the US). Otherwise use exactly the exchange you name. Can take a couple
+    of minutes the first time - that's normal. Cached to CSV by the caller.
+    """
+    sources = _fallback_sources(symbol) if exchange_id == "auto" else [(exchange_id, symbol)]
+    last_err: Exception | None = None
+    for ex_id, sym in sources:
+        try:
+            exchange = getattr(ccxt, ex_id)({"enableRateLimit": True})
+            exchange.fetch_ohlcv(sym, timeframe, limit=5)  # quick reachability probe
+        except Exception as exc:
+            last_err = exc
+            logger.warning("{} unavailable ({}); trying next source...",
+                           ex_id, str(exc).splitlines()[0][:70])
+            continue
+        logger.info("Downloading ~{} years of {} {} from {}...", years, sym, timeframe, ex_id)
+        df = _paginate(exchange, sym, timeframe, years)
+        if len(df) > 100:
+            logger.info("Downloaded {} candles from {}.", len(df), ex_id)
+            return df
+    raise RuntimeError(f"Could not download data from any source. Last error: {last_err}")
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -134,7 +172,7 @@ def load_csv(path: str) -> pd.DataFrame:
 def get_data(args, cfg) -> pd.DataFrame:
     """Decide where candles come from: explicit CSV, cached CSV, or fresh download."""
     os.makedirs(BACKTEST_DIR, exist_ok=True)
-    symbol = cfg["market"]["symbol"]
+    symbol = args.symbol or cfg["market"]["symbol"]
     timeframe = cfg["market"]["timeframe"]
 
     if args.csv:
@@ -145,7 +183,7 @@ def get_data(args, cfg) -> pd.DataFrame:
         logger.info("Using cached candles at {} (delete it to re-download).", DEFAULT_CSV)
         return load_csv(DEFAULT_CSV)
 
-    df = download_history(symbol, timeframe, args.years)
+    df = download_history(symbol, timeframe, args.years, args.exchange)
     df.to_csv(DEFAULT_CSV, index=False)
     logger.info("Cached candles to {}", DEFAULT_CSV)
     return df
@@ -505,6 +543,10 @@ def main() -> None:
     parser.add_argument("--csv", type=str, default=None, help="Path to a candle CSV to use.")
     parser.add_argument("--years", type=float, default=2.0, help="Years of history to download.")
     parser.add_argument("--capital", type=float, default=None, help="Starting capital (USD).")
+    parser.add_argument("--exchange", type=str, default="auto",
+                        help="Data source: 'auto' (try several), or e.g. binanceus, okx, coinbase.")
+    parser.add_argument("--symbol", type=str, default=None,
+                        help="Market symbol, e.g. BTC/USDT (default from config).")
     args = parser.parse_args()
 
     logger.remove()

@@ -48,6 +48,9 @@ def load_config() -> dict[str, Any]:
     # ---- Secrets & runtime mode (env only) ----
     cfg["runtime"] = {
         "paper_trading": _env_bool("PAPER_TRADING", True),
+        # Which exchange to use: "binance" (binance.com, futures) or
+        # "binanceus" (Binance.US, spot - required for US users).
+        "exchange_id": os.getenv("EXCHANGE_ID", "binance").strip().lower(),
         "binance_api_key": os.getenv("BINANCE_API_KEY", ""),
         "binance_api_secret": os.getenv("BINANCE_API_SECRET", ""),
         "binance_testnet": _env_bool("BINANCE_TESTNET", True),
