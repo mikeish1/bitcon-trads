@@ -1,0 +1,23 @@
+# Secrets & local state
+.env
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.log
+
+# Claude Code local settings
+.claude/settings.local.json

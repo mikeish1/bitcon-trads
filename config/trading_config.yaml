@@ -1,0 +1,63 @@
+# =============================================================================
+# Bitcoin Ensemble Trading System - Configuration
+# =============================================================================
+# Everything here has a SAFE, CONSERVATIVE default.
+# A basic user almost never needs to touch this file.
+# Anything secret (API keys) or that you want to flip quickly (paper vs live)
+# lives in ENVIRONMENT VARIABLES instead - see .env.example.
+#
+# Environment variables ALWAYS override the values in this file.
+# =============================================================================
+
+market:
+  symbol: "BTC/USDT"          # ccxt unified symbol for BTCUSDT perpetual/spot
+  timeframe: "5m"             # 5-minute candles
+  backfill_candles: 500       # how many historical candles to load on startup
+  use_websocket: true         # try WebSocket first; auto-falls back to polling
+
+ensemble:
+  total_paths: 31             # total prediction paths in the ensemble
+  deterministic_paths: 28     # fast TA/statistical voters
+  claude_paths: 3             # LLM expert voters (only used on borderline cases)
+
+  # --- Consensus thresholds (the heart of the strategy) ---
+  trade_threshold: 28         # need >= 28 of 31 agreeing to OPEN a trade
+  discard_threshold: 26       # < 26 agreeing  -> stay flat, do nothing
+  # 26 or 27 agreeing == "marginal" -> ask the 3 Claude voters to break the tie.
+
+  # Claude is ONLY consulted when the deterministic agreement count lands in
+  # this inclusive band. Keeps API usage (and cost) tiny.
+  claude_consult_min: 20
+  claude_consult_max: 27
+
+risk:
+  starting_capital_usd: 1000.0   # only used if no live balance is available (paper mode)
+  max_risk_per_trade: 0.01       # hard cap: never risk more than 1% of equity per trade
+  kelly_fraction: 0.25           # fractional Kelly multiplier (conservative)
+  kelly_assumed_payoff: 1.5      # reward:risk used in the Kelly formula
+  min_trade_usd: 10.0            # skip trades smaller than this (dust)
+  max_position_pct: 0.50         # never let one position exceed 50% of equity (notional)
+  stop_loss_pct: 0.015           # 1.5% stop loss from entry
+  take_profit_pct: 0.025         # 2.5% take profit from entry
+  leverage: 1                    # keep at 1 unless you REALLY know what you're doing
+
+safety:
+  daily_loss_limit_pct: 0.03     # stop trading for the day after -3% equity
+  weekly_loss_limit_pct: 0.07    # stop trading for the week after -7% equity
+  max_consecutive_losses: 4      # circuit breaker: pause after 4 losses in a row
+  cooldown_minutes: 30           # wait this long after closing a trade before re-entering
+  max_open_positions: 1          # one position at a time (simple + safe)
+
+execution:
+  paper_slippage_pct: 0.0005     # simulated slippage on paper fills (0.05%)
+  taker_fee_pct: 0.0004          # assumed taker fee per side (0.04%)
+
+claude:
+  # Model used for borderline validation + the daily summary.
+  # Default is the cheapest capable model. Override with CLAUDE_MODEL env var.
+  model: "claude-haiku-4-5"
+  max_tokens: 1024
+  daily_summary_hour_utc: 0      # send the daily summary at this UTC hour
+
+logging:
+  level: "INFO"                  # DEBUG for very verbose output

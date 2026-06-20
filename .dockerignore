@@ -1,0 +1,19 @@
+# Keep the image small and never ship secrets or local state.
+.env
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.git/
+.gitignore
+.idea/
+.vscode/
+*.log
+.DS_Store
+README.md
