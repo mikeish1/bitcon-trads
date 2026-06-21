@@ -7,11 +7,26 @@
 # =============================================================================
 
 market:
-  symbol: "BTC/USDT"          # spot pair (BTC/USD on Alpaca). Buy BTC with cash.
+  symbol: "BTC/USDT"          # default single symbol (used only by single-asset tools)
   primary_timeframe: "1d"     # DAILY base timeframe for the trend-follower
   confirm_timeframes: []      # donchian mode uses a single timeframe
   backfill_candles: 400       # daily candles on startup (~1.1y; warms indicators)
   poll_seconds: 900           # check every 15 min (a daily strategy needs no faster)
+
+# --- The trading universe (dynamic; add/remove coins here, no code changes) --
+# List the BASE assets you want to trade. The quote currency is chosen per venue
+# automatically (USD on Alpaca, USDT on Binance.US). Coins the live venue does
+# not list are skipped at startup with a warning - so it's safe to list all of
+# them. Override the list at runtime with the SYMBOLS env var (e.g. "BTC,ETH,SOL").
+universe:
+  bases: [BTC, ETH, BNB, SOL, XRP, DOGE, ADA, VET]
+  overrides: {}              # optional per-asset tuning, e.g. {ETH: {entry_period: 30}}
+
+# --- Portfolio-level risk controls (across ALL coins) -----------------------
+portfolio:
+  max_concurrent_positions: 3   # never hold more than this many coins at once
+  max_total_exposure_pct: 0.90  # cap total $ deployed across all positions (of equity)
+  per_asset_alloc_pct: 0.30     # cap any single position at this fraction of equity
 
 # --- Strategy selection -----------------------------------------------------
 strategy:

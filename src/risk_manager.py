@@ -1,15 +1,20 @@
 """
-Risk manager for spot, long-only trading.
+Risk manager (multi-asset spot, long-only).
 
-- Dynamic position sizing: risk a small % of portfolio equity per trade, scaled
-  by a conservative fractional-Kelly factor, sized off the ATR-based stop
-  distance. Default capital $250 in paper mode; in live mode equity is your real
-  portfolio value (USDT + BTC).
-- ATR-based initial stop, R-multiple take-profit, and ratcheting trailing stop.
-- Safety rails: daily/weekly loss limits, consecutive-loss circuit breaker,
-  post-trade cooldown, max trades/day, single position.
-- SQLite persistence so positions and stats survive restarts; plus a
-  reconcile() that compares the DB to your real balances on startup.
+- Per-asset positions (one open position per coin), tracked in SQLite so they
+  survive restarts. State + a full trade log persist across redeploys.
+- Portfolio-level controls: max concurrent positions, max total exposure across
+  all coins, and a per-asset allocation cap.
+- Per-coin cooldown; global daily/weekly loss limits and a consecutive-loss
+  circuit breaker (across the whole portfolio).
+- Donchian sizing (binary long/flat with a chandelier trail) plus the legacy
+  ATR-stop Kelly sizing for high_conviction mode.
+
+Equity:
+  * broker venues (Alpaca paper / live): real account value = quote cash +
+    sum(base holdings x price).
+  * internal simulation: a cash ledger (paper_cash) + open positions marked to
+    market.
 
 Tune numbers in config/trading_config.yaml.
 """
@@ -26,14 +31,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _base_of(symbol: str) -> str:
+    return symbol.split("/")[0]
+
+
 class RiskManager:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
-        # uses_broker: read equity from the venue (Alpaca paper or any live).
-        # real_money: those funds are real (affects only labels/warnings).
         self.uses_broker = cfg["runtime"]["uses_broker"]
         self.real_money = cfg["runtime"]["real_money"]
         r, s, e = cfg["risk"], cfg["safety"], cfg["exits"]
+        pf = cfg.get("portfolio", {})
 
         self.default_capital = r["default_capital_usd"]
         self.risk_per_trade = r["risk_per_trade_pct"]
@@ -47,15 +55,18 @@ class RiskManager:
         self.atr_trail_mult = e["atr_trail_mult"]
         self.take_profit_R = e["take_profit_R"]
         self.stop_limit_offset = e["stop_limit_offset_pct"]
-        # Donchian trend-follower: chandelier trail multiplier (falls back to ATR trail).
-        dn = cfg.get("strategy", {}).get("donchian", {})
-        self.chandelier_mult = dn.get("atr_trail_mult", self.atr_trail_mult)
+        self.chandelier_mult = cfg.get("strategy", {}).get("donchian", {}).get(
+            "atr_trail_mult", self.atr_trail_mult)
 
         self.daily_loss_limit = s["daily_loss_limit_pct"]
         self.weekly_loss_limit = s["weekly_loss_limit_pct"]
         self.max_consec_losses = s["max_consecutive_losses"]
         self.cooldown_minutes = s["cooldown_minutes"]
         self.max_trades_per_day = s["max_trades_per_day"]
+
+        self.max_concurrent = pf.get("max_concurrent_positions", 3)
+        self.max_total_exposure = pf.get("max_total_exposure_pct", 0.90)
+        self.per_asset_alloc = pf.get("per_asset_alloc_pct", 0.30)
 
         self.conn = sqlite3.connect(cfg["runtime"]["db_path"], check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -69,6 +80,7 @@ class RiskManager:
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
                 opened_at TEXT, closed_at TEXT,
                 entry_price REAL, exit_price REAL,
                 qty REAL, cost_usd REAL, entry_fee REAL, exit_fee REAL,
@@ -78,21 +90,25 @@ class RiskManager:
             );
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT, action TEXT, conviction INTEGER,
+                ts TEXT, symbol TEXT, action TEXT, conviction INTEGER,
                 consulted_claude INTEGER, reasoning TEXT
             );
             """
         )
-        # Migrate older DBs that predate the peak_price column.
+        # Migrate older single-asset DBs.
         cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(trades)")]
-        if "peak_price" not in cols:
-            self.conn.execute("ALTER TABLE trades ADD COLUMN peak_price REAL")
+        for col in ("peak_price", "symbol"):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {'REAL' if col=='peak_price' else 'TEXT'}")
+        dcols = [r["name"] for r in self.conn.execute("PRAGMA table_info(decisions)")]
+        if "symbol" not in dcols:
+            self.conn.execute("ALTER TABLE decisions ADD COLUMN symbol TEXT")
         self.conn.commit()
 
     def _seed(self) -> None:
-        if self._get("paper_equity") is None:
+        if self._get("paper_cash") is None:
             now = _utcnow()
-            self._set("paper_equity", self.default_capital)
+            self._set("paper_cash", self.default_capital)
             self._set("day_date", now.date().isoformat())
             self._set("day_start_equity", self.default_capital)
             self._set("week_id", f"{now.isocalendar().year}-{now.isocalendar().week}")
@@ -100,8 +116,7 @@ class RiskManager:
             self._set("consecutive_losses", 0)
             self._set("wins", 0)
             self._set("losses", 0)
-            self._set("last_close_ts", "")
-            logger.info("State seeded. Paper equity ${:.2f}.", self.default_capital)
+            logger.info("State seeded. Paper cash ${:.2f}.", self.default_capital)
 
     # ------------------------------------------------------------------ #
     def _get(self, k: str) -> Optional[str]:
@@ -109,9 +124,8 @@ class RiskManager:
         return row["value"] if row else None
 
     def _set(self, k: str, v: Any) -> None:
-        self.conn.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
+        self.conn.execute("INSERT INTO state(key,value) VALUES(?,?) "
+                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
         self.conn.commit()
 
     def _getf(self, k: str, d: float = 0.0) -> float:
@@ -125,13 +139,38 @@ class RiskManager:
         return int(self._getf(k, d))
 
     # ------------------------------------------------------------------ #
-    # Equity                                                            #
+    # Positions                                                          #
     # ------------------------------------------------------------------ #
-    def current_equity(self, balances: dict[str, float], price: float) -> float:
-        """Broker (Alpaca paper / live): real account value. Else: simulated equity."""
+    def open_position(self, symbol: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM trades WHERE status='OPEN' AND symbol=? ORDER BY id DESC LIMIT 1",
+            (symbol,)).fetchone()
+
+    def open_positions(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall())
+
+    def open_value(self, prices: dict[str, float]) -> float:
+        """Mark-to-market value of all open positions (prices keyed by base asset)."""
+        total = 0.0
+        for p in self.open_positions():
+            base = _base_of(p["symbol"] or "")
+            total += p["qty"] * prices.get(base, p["entry_price"])
+        return total
+
+    # ------------------------------------------------------------------ #
+    # Equity                                                             #
+    # ------------------------------------------------------------------ #
+    def current_equity(self, balances: dict[str, float], prices: dict[str, float]) -> float:
         if self.uses_broker:
-            return balances.get("USDT", 0.0) + balances.get("BTC", 0.0) * price
-        return self._getf("paper_equity", self.default_capital)
+            quote = balances.get(self.cfg.get("quote_ccy", "USDT"), 0.0)
+            holdings = sum(balances.get(b, 0.0) * pr for b, pr in prices.items())
+            return quote + holdings
+        return self._getf("paper_cash", self.default_capital) + self.open_value(prices)
+
+    def available_quote(self, balances: dict[str, float]) -> float:
+        if self.uses_broker:
+            return balances.get(self.cfg.get("quote_ccy", "USDT"), 0.0)
+        return self._getf("paper_cash", self.default_capital)
 
     def _roll_periods(self, equity: float) -> None:
         now = _utcnow()
@@ -144,22 +183,21 @@ class RiskManager:
         if self._get("week_id") != wk:
             self._set("week_id", wk)
             self._set("week_start_equity", equity)
-            logger.info("New ISO week - weekly limit reset.")
 
     def _trades_today(self) -> int:
         today = _utcnow().date().isoformat()
-        row = self.conn.execute(
-            "SELECT COUNT(*) c FROM trades WHERE substr(opened_at,1,10)=?", (today,)).fetchone()
-        return int(row["c"])
+        return int(self.conn.execute(
+            "SELECT COUNT(*) c FROM trades WHERE substr(opened_at,1,10)=?", (today,)).fetchone()["c"])
 
     # ------------------------------------------------------------------ #
-    # Safety gate                                                        #
+    # Safety gate (per asset + portfolio)                                #
     # ------------------------------------------------------------------ #
-    def can_open_trade(self, equity: float) -> tuple[bool, str]:
+    def can_open_trade(self, symbol: str, equity: float, n_open: int) -> tuple[bool, str]:
         self._roll_periods(equity)
-        if self.open_position() is not None:
-            return False, "position already open"
-
+        if self.open_position(symbol) is not None:
+            return False, f"already in {symbol}"
+        if n_open >= self.max_concurrent:
+            return False, f"max concurrent positions ({self.max_concurrent})"
         day_start = self._getf("day_start_equity", equity)
         if day_start > 0 and (equity - day_start) / day_start <= -self.daily_loss_limit:
             return False, f"daily loss limit ({(equity/day_start-1):.2%})"
@@ -169,13 +207,13 @@ class RiskManager:
         if self._geti("consecutive_losses") >= self.max_consec_losses:
             return False, f"circuit breaker ({self._geti('consecutive_losses')} losses in a row)"
         if self._trades_today() >= self.max_trades_per_day:
-            return False, f"max trades/day reached ({self.max_trades_per_day})"
-        last = self._get("last_close_ts")
+            return False, f"max trades/day ({self.max_trades_per_day})"
+        last = self._get(f"last_close_ts:{symbol}")
         if last:
             try:
                 mins = (_utcnow() - datetime.fromisoformat(last)).total_seconds() / 60
                 if mins < self.cooldown_minutes:
-                    return False, f"cooldown ({mins:.0f}/{self.cooldown_minutes} min)"
+                    return False, f"{symbol} cooldown ({mins:.0f}/{self.cooldown_minutes} min)"
             except ValueError:
                 pass
         return True, "ok"
@@ -183,113 +221,74 @@ class RiskManager:
     # ------------------------------------------------------------------ #
     # Sizing                                                             #
     # ------------------------------------------------------------------ #
-    def _win_rate(self) -> float:
-        w, l = self._geti("wins"), self._geti("losses")
-        return 0.5 if (w + l) < 10 else w / (w + l)
+    def size_for_asset(self, equity: float, available_quote: float, open_value: float) -> dict[str, Any]:
+        """Portfolio-aware allocation for one new position (trend-follower)."""
+        per_asset_cap = equity * self.per_asset_alloc
+        exposure_budget = max(0.0, equity * self.max_total_exposure - open_value)
+        spend = min(per_asset_cap, exposure_budget, available_quote * self.max_position_pct)
+        return {"spend_usd": spend, "viable": spend >= self.min_notional}
 
-    def size_buy(self, equity: float, available_usdt: float,
-                 price: float, atr: float) -> dict[str, Any]:
-        """
-        Dynamic fractional-Kelly sizing off the ATR stop distance.
+    def chandelier_stop(self, peak: float, atr: float) -> float:
+        return peak - self.chandelier_mult * atr
 
-        stop_distance = atr_stop_mult * ATR
-        risk_amount   = equity * risk_fraction   (~loss if the stop is hit)
-        spend         = risk_amount * price / stop_distance, capped by USDT.
-        """
-        # ATR-based, but floored at min_stop_pct so a tiny 5m ATR can't create a
-        # noise-tight stop that whipsaws us out instantly.
-        stop_distance = max(self.atr_stop_mult * atr, price * self.min_stop_pct)
-        stop_price = price - stop_distance
-
-        win = self._win_rate()
-        kelly_star = max(win - (1.0 - win) / self.kelly_payoff, 0.0)
-        risk_fraction = min(self.kelly_fraction * kelly_star, self.risk_per_trade)
-        risk_fraction = max(risk_fraction, self.risk_per_trade * 0.25)  # small floor
-
-        risk_amount = equity * risk_fraction
-        spend = risk_amount * price / stop_distance
-
-        # With a real (or paper-broker) account we can't spend more cash than we hold.
-        cap = available_usdt * self.max_position_pct if self.uses_broker else equity * self.max_position_pct
-        spend = min(spend, cap)
-
-        take_price = price + self.take_profit_R * stop_distance
-        return {
-            "spend_usd": spend,
-            "stop_price": stop_price,
-            "take_price": take_price,
-            "stop_distance": stop_distance,
-            "risk_fraction": risk_fraction,
-            "win_rate": win,
-            "viable": spend >= self.min_notional,
-        }
+    def stop_limit_price(self, stop_price: float) -> float:
+        return stop_price * (1 - self.stop_limit_offset)
 
     def trailing_stop(self, price: float, atr: float) -> float:
         return price - max(self.atr_trail_mult * atr, price * self.min_stop_pct)
 
-    # --- Donchian trend-follower helpers ---
-    def chandelier_stop(self, peak: float, atr: float) -> float:
-        """Exit level = highest close held minus chandelier_mult x ATR."""
-        return peak - self.chandelier_mult * atr
+    def _win_rate(self) -> float:
+        w, l = self._geti("wins"), self._geti("losses")
+        return 0.5 if (w + l) < 10 else w / (w + l)
 
-    def size_full(self, equity: float, available_usdt: float) -> dict[str, Any]:
-        """Full allocation (the trend-follower is binary long/flat; the trail is the stop)."""
-        cash = available_usdt if self.uses_broker else equity
-        spend = cash * self.max_position_pct
-        return {"spend_usd": spend, "viable": spend >= self.min_notional}
-
-    def update_trail(self, trade_id: int, peak: float, stop: float,
-                     stop_order_id: Optional[str]) -> None:
-        self.conn.execute(
-            "UPDATE trades SET peak_price=?, current_stop=?, stop_order_id=? WHERE id=?",
-            (peak, stop, stop_order_id, trade_id))
-        self.conn.commit()
-
-    def stop_limit_price(self, stop_price: float) -> float:
-        """Limit price sits just below the stop trigger to improve fill odds."""
-        return stop_price * (1 - self.stop_limit_offset)
+    def size_buy(self, equity: float, available_usdt: float, price: float, atr: float) -> dict[str, Any]:
+        """Legacy high_conviction ATR-stop Kelly sizing (single asset)."""
+        stop_distance = max(self.atr_stop_mult * atr, price * self.min_stop_pct)
+        win = self._win_rate()
+        kelly_star = max(win - (1.0 - win) / self.kelly_payoff, 0.0)
+        rf = max(min(self.kelly_fraction * kelly_star, self.risk_per_trade), self.risk_per_trade * 0.25)
+        spend = min(equity * rf * price / stop_distance, available_usdt * self.max_position_pct)
+        return {"spend_usd": spend, "stop_price": price - stop_distance,
+                "take_price": price + self.take_profit_R * stop_distance,
+                "risk_fraction": rf, "viable": spend >= self.min_notional}
 
     # ------------------------------------------------------------------ #
-    # Position lifecycle                                                 #
+    # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
-    def open_position(self) -> Optional[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1").fetchone()
-
-    def record_open(self, fill: dict[str, Any], stop_price: float, take_price: float,
-                    stop_order_id: Optional[str], reason: str,
-                    peak_price: Optional[float] = None) -> int:
+    def record_open(self, symbol: str, fill: dict[str, Any], stop_price: float, take_price: float,
+                    stop_order_id: Optional[str], reason: str, peak_price: Optional[float] = None) -> int:
         mode = "LIVE" if self.real_money else "PAPER"
         peak = peak_price if peak_price is not None else fill["price"]
         cur = self.conn.execute(
-            "INSERT INTO trades(opened_at, entry_price, qty, cost_usd, entry_fee, "
+            "INSERT INTO trades(symbol, opened_at, entry_price, qty, cost_usd, entry_fee, "
             "stop_price, take_price, current_stop, peak_price, stop_order_id, status, mode, reason) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (_utcnow().isoformat(), fill["price"], fill["qty"], fill["cost"], fill["fee"],
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (symbol, _utcnow().isoformat(), fill["price"], fill["qty"], fill["cost"], fill["fee"],
              stop_price, take_price, stop_price, peak, stop_order_id, "OPEN", mode, reason))
+        if not self.uses_broker:  # sim cash ledger
+            self._set("paper_cash", self._getf("paper_cash") - (fill["cost"] + fill["fee"]))
         self.conn.commit()
-        logger.info("OPENED LONG {:.6f} BTC @ {:.2f} | stop {:.2f} | target {:.2f} [{}]",
-                    fill["qty"], fill["price"], stop_price, take_price, mode)
+        logger.info("OPENED {} {:.6f} @ {:.4f} | stop {:.4f} [{}]",
+                    symbol, fill["qty"], fill["price"], stop_price, mode)
         return int(cur.lastrowid)
 
-    def update_stop(self, trade_id: int, new_stop: float, stop_order_id: Optional[str]) -> None:
-        self.conn.execute("UPDATE trades SET current_stop=?, stop_order_id=? WHERE id=?",
-                          (new_stop, stop_order_id, trade_id))
+    def update_trail(self, trade_id: int, peak: float, stop: float, stop_order_id: Optional[str]) -> None:
+        self.conn.execute("UPDATE trades SET peak_price=?, current_stop=?, stop_order_id=? WHERE id=?",
+                          (peak, stop, stop_order_id, trade_id))
         self.conn.commit()
 
-    def record_close(self, trade: sqlite3.Row, exit_price: float,
-                     exit_fee: float, reason: str) -> float:
+    def record_close(self, trade: sqlite3.Row, exit_price: float, exit_fee: float, reason: str) -> float:
         entry, qty = trade["entry_price"], trade["qty"]
         entry_fee = trade["entry_fee"] or 0.0
-        pnl = (exit_price - entry) * qty - entry_fee - exit_fee
+        proceeds = exit_price * qty - exit_fee
+        pnl = proceeds - (trade["cost_usd"] + entry_fee)
         self.conn.execute(
-            "UPDATE trades SET closed_at=?, exit_price=?, exit_fee=?, pnl_usd=?, "
-            "status='CLOSED', reason=? WHERE id=?",
+            "UPDATE trades SET closed_at=?, exit_price=?, exit_fee=?, pnl_usd=?, status='CLOSED', "
+            "reason=? WHERE id=?",
             (_utcnow().isoformat(), exit_price, exit_fee, pnl, reason, trade["id"]))
-
         if not self.uses_broker:
-            self._set("paper_equity", self._getf("paper_equity") + pnl)
-        self._set("last_close_ts", _utcnow().isoformat())
+            self._set("paper_cash", self._getf("paper_cash") + proceeds)
+        self._set(f"last_close_ts:{trade['symbol']}", _utcnow().isoformat())
         if pnl >= 0:
             self._set("wins", self._geti("wins") + 1)
             self._set("consecutive_losses", 0)
@@ -297,36 +296,28 @@ class RiskManager:
             self._set("losses", self._geti("losses") + 1)
             self._set("consecutive_losses", self._geti("consecutive_losses") + 1)
         self.conn.commit()
-        logger.info("CLOSED LONG @ {:.2f} | PnL ${:.2f} | reason: {}", exit_price, pnl, reason)
+        logger.info("CLOSED {} @ {:.4f} | PnL ${:.2f} | {}", trade["symbol"], exit_price, pnl, reason)
         return pnl
 
-    def log_decision(self, action: str, conviction: int, consulted: bool, reasoning: str) -> None:
+    def log_decision(self, symbol: str, action: str, conviction: int, consulted: bool, reasoning: str) -> None:
         self.conn.execute(
-            "INSERT INTO decisions(ts, action, conviction, consulted_claude, reasoning) "
-            "VALUES(?,?,?,?,?)",
-            (_utcnow().isoformat(), action, conviction, int(consulted), reasoning))
+            "INSERT INTO decisions(ts, symbol, action, conviction, consulted_claude, reasoning) "
+            "VALUES(?,?,?,?,?,?)",
+            (_utcnow().isoformat(), symbol, action, conviction, int(consulted), reasoning))
         self.conn.commit()
 
-    # ------------------------------------------------------------------ #
-    # Startup reconciliation                                             #
-    # ------------------------------------------------------------------ #
-    def reconcile(self, balances: dict[str, float], price: float) -> None:
-        """Compare the DB's idea of our position to real balances (broker only)."""
+    def reconcile(self, balances: dict[str, float], prices: dict[str, float]) -> None:
+        """Close DB positions whose coins are no longer in the account (broker only)."""
         if not self.uses_broker:
             return
-        pos = self.open_position()
-        btc = balances.get("BTC", 0.0)
-        dust = self.min_notional / price if price else 0.0
-
-        if pos is not None and btc < dust:
-            # We thought we held BTC, but it's gone - the exchange stop likely
-            # filled while we were offline. Close the books at the recorded stop.
-            logger.warning("Reconcile: open trade in DB but no BTC on exchange - "
-                           "closing it (stop likely filled offline).")
-            self.record_close(pos, pos["current_stop"] or price, 0.0, "offline stop fill")
-        elif pos is None and btc >= dust:
-            logger.warning("Reconcile: {:.6f} BTC on exchange but no tracked position. "
-                           "Leaving it untouched - sell manually if unexpected.", btc)
+        for pos in self.open_positions():
+            base = _base_of(pos["symbol"] or "")
+            price = prices.get(base, pos["entry_price"])
+            dust = self.min_notional / price if price else 0.0
+            if balances.get(base, 0.0) < dust and pos["qty"] > dust:
+                logger.warning("Reconcile: {} gone from account - closing (stop likely filled).",
+                               pos["symbol"])
+                self.record_close(pos, pos["current_stop"] or price, 0.0, "offline stop fill")
 
     # ------------------------------------------------------------------ #
     def daily_stats(self, equity: float) -> dict[str, Any]:
@@ -341,6 +332,7 @@ class RiskManager:
             "date_utc": today,
             "mode": "LIVE" if self.real_money else "PAPER",
             "equity": round(equity, 2),
+            "open_positions": len(self.open_positions()),
             "day_return_pct": round((equity / day_start - 1) * 100, 2) if day_start else 0,
             "week_return_pct": round((equity / week_start - 1) * 100, 2) if week_start else 0,
             "trades_today": self._trades_today(),
