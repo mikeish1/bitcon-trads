@@ -26,6 +26,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from src.settings_service import CapitalSettingsService
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -67,6 +69,16 @@ class RiskManager:
         self.max_concurrent = pf.get("max_concurrent_positions", 3)
         self.max_total_exposure = pf.get("max_total_exposure_pct", 0.90)
         self.per_asset_alloc = pf.get("per_asset_alloc_pct", 0.30)
+
+        # Centralized, user-adjustable deployable-capital limit. This is the SINGLE
+        # cap on the total dollar envelope the spot bot may have committed at once.
+        # It subsumes the legacy `portfolio.max_total_exposure_pct` (which remains
+        # the default), and can be tightened to a fixed USD amount, a % of equity
+        # or cash, or a combination - via YAML, env vars, or the settings service.
+        self.settings = CapitalSettingsService(cfg)
+        self.capital_policy = self.settings.policy("spot")
+        logger.info("Spot {} (source: {}).", self.capital_policy.describe(),
+                    self.settings.resolve_mapping("spot")[1])
 
         vt = cfg.get("strategy", {}).get("vol_target", {})
         self.vol_target_enabled = vt.get("enabled", False)
@@ -240,7 +252,10 @@ class RiskManager:
         if self.vol_target_enabled and atr_pct and atr_pct > 0:
             # Shrink size for coins more volatile than target (clamp 0.2x..1x).
             per_asset_cap *= min(1.0, max(0.2, self.vol_target_daily / atr_pct))
-        exposure_budget = max(0.0, equity * self.max_total_exposure - open_value)
+        # Total-envelope cap comes from the centralized deployable-capital policy;
+        # relative allocation (per-asset cap, available-cash limit) is unchanged.
+        exposure_budget = float(self.capital_policy.remaining_capacity(
+            equity, available_quote, open_value))
         spend = min(per_asset_cap, exposure_budget, available_quote * self.max_position_pct)
         return {"spend_usd": spend, "viable": spend >= self.min_notional}
 
@@ -249,9 +264,29 @@ class RiskManager:
         """Equal-weight (1/K of equity) sizing for a momentum-rotation entry,
         still bounded by the portfolio exposure cap and available cash."""
         target = equity / max(top_k, 1)
-        exposure_budget = max(0.0, equity * self.max_total_exposure - open_value)
+        exposure_budget = float(self.capital_policy.remaining_capacity(
+            equity, available_quote, open_value))
         spend = min(target, exposure_budget, available_quote * self.max_position_pct)
         return {"spend_usd": spend, "viable": spend >= self.min_notional}
+
+    def maybe_reload_policy(self) -> bool:
+        """Hot-reload the deployable-capital limit if the override file changed on
+        disk. Lets the user (or a frontend) re-cap capital WITHOUT a restart. Falls
+        back to the existing policy if the new mapping is invalid. Returns True if
+        the policy changed."""
+        if not self.settings.override_changed_on_disk():
+            return False
+        try:
+            new_policy = self.settings.policy("spot")
+        except Exception as exc:  # keep the last-known-good policy on bad input
+            logger.warning("Capital-limit reload rejected (keeping current): {}", exc)
+            return False
+        if new_policy == self.capital_policy:
+            return False
+        logger.warning("Deployable-capital limit reloaded: {} -> {}",
+                       self.capital_policy.describe(), new_policy.describe())
+        self.capital_policy = new_policy
+        return True
 
     # Small state passthrough (used by the rotation clock in the loop).
     def state_get(self, key: str) -> Optional[str]:

@@ -27,8 +27,35 @@ universe:
 # --- Portfolio-level risk controls (across ALL coins) -----------------------
 portfolio:
   max_concurrent_positions: 3   # never hold more than this many coins at once
-  max_total_exposure_pct: 0.90  # cap total $ deployed across all positions (of equity)
+  max_total_exposure_pct: 0.90  # LEGACY default envelope (of equity); see capital_policy
   per_asset_alloc_pct: 0.30     # cap any single position at this fraction of equity
+
+# --- Deployable-capital limit (THE master cap; user-adjustable) -------------
+# The single, centralized ceiling on how much capital the system may have
+# committed to trades at once. It governs the TOTAL envelope only - it does not
+# change how capital is ranked/allocated to the best opportunities within it.
+#
+#   max_pct    : fraction (0..1] of the `basis` that may be deployed (0.90 = 90%).
+#   max_usd    : absolute USD ceiling on deployed capital (omit for "no USD cap").
+#   basis      : "equity" (total account value) | "cash" (free quote balance).
+#   precedence : when BOTH caps are set, how to combine them -
+#                "min" (safest, default) | "max" | "usd" | "pct".
+# At least one of max_pct / max_usd must be set. Per-sleeve overrides are allowed
+# (capital_policy.spot / .carry / .etf); a flat block applies to the spot sleeve.
+#
+# Resolution precedence (highest wins): env vars (MAX_DEPLOYED_CAPITAL_*) >
+# config/capital_limits.json (written by the settings service / future frontend,
+# hot-reloaded without restart) > this block > the legacy values above.
+#
+# Defaults below reproduce the legacy behavior exactly (90% of equity). To impose
+# a hard dollar ceiling, uncomment max_usd (it then binds via `min`). Examples:
+#   spot: {max_pct: 0.90, max_usd: 1000, basis: equity, precedence: min}
+capital_policy:
+  spot:
+    max_pct: 0.90             # <= 90% of equity (matches the legacy default)
+    # max_usd: 1000.0         # uncomment to also cap deployed capital at $1,000
+    basis: "equity"
+    precedence: "min"
 
 # --- Strategy selection -----------------------------------------------------
 strategy:

@@ -13,6 +13,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from src.settings_service import CapitalSettingsService
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -25,6 +27,9 @@ class EtfRiskManager:
         self.sleeve = float(e["capital"]["sleeve_usd"])
         self.max_exposure = float(e["capital"]["max_total_exposure_pct"])
         self.min_notional = float(e["capital"]["min_notional_usd"])
+        # Centralized deployable-capital envelope for the ETF sleeve (defaults to
+        # the legacy equity * max_total_exposure_pct; user-adjustable like spot).
+        self.capital_policy = CapitalSettingsService(cfg).policy("etf")
         self.top_k = int(e["selection"]["top_k"])
         rt = cfg["etf_runtime"]
         self.mode = rt["mode"]
@@ -120,7 +125,7 @@ class EtfRiskManager:
     def size(self, equity: float, available_cash: float, exposure_used: float) -> dict[str, Any]:
         """Equal-weight 1/K target, bounded by the exposure cap and free cash."""
         target = equity / max(self.top_k, 1)
-        budget = max(0.0, equity * self.max_exposure - exposure_used)
+        budget = float(self.capital_policy.remaining_capacity(equity, available_cash, exposure_used))
         spend = min(target, budget, available_cash)
         return {"spend_usd": spend, "viable": spend >= self.min_notional}
 

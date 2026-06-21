@@ -3,6 +3,9 @@
 *.db
 *.sqlite
 *.sqlite3
+# Runtime deployable-capital override written by the settings service / frontend.
+# (On ephemeral hosts like Railway, persist the limit via MAX_DEPLOYED_CAPITAL_* env vars.)
+config/capital_limits.json
 
 # Backtest data + generated results (can be large; regenerate anytime)
 backtests/

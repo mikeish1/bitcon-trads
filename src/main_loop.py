@@ -173,6 +173,9 @@ class TradingBot:
 
     # ------------------------------------------------------------------ #
     def _cycle(self) -> None:
+        # Pick up a changed deployable-capital limit without a restart (no-op if
+        # the override file is untouched).
+        self.risk.maybe_reload_policy()
         balances = self.data.fetch_balances()
         snap: dict[str, dict] = {}   # symbol -> {frames, price, atr, candle_ts}
         prices: dict[str, float] = {}
