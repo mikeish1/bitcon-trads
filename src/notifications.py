@@ -96,3 +96,8 @@ class Notifier:
 
     def error(self, message: str) -> None:
         self._send(f"⚠️ ALERT\n{message}")
+
+    def message(self, text: str) -> None:
+        """Generic passthrough for sibling strategies (e.g. funding carry) that
+        compose their own alert text. Still a silent no-op when Telegram is off."""
+        self._send(text)

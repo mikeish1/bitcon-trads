@@ -1,0 +1,4 @@
+# ETF live-equities adapter — only needed for the ETF bot on venue: alpaca
+# (both data and orders). The crypto/carry bots do NOT need this.
+#   pip install -r requirements-etf.txt
+alpaca-py>=0.30

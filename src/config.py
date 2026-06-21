@@ -92,6 +92,12 @@ def load_config() -> dict[str, Any]:
                                  "max_total_exposure_pct": 0.90,
                                  "per_asset_alloc_pct": 0.30})
 
+    # Allocation mode (env override flips it without editing YAML).
+    cfg["strategy"].setdefault("allocation", {"mode": "first_come"})
+    alloc_env = os.getenv("ALLOCATION_MODE")
+    if alloc_env:
+        cfg["strategy"]["allocation"]["mode"] = alloc_env.strip().lower()
+
     cfg["runtime"] = {
         "paper_trading": paper,
         "live_trading_enabled": live_enabled,

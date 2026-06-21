@@ -187,6 +187,7 @@ class DonchianStrategy:
         d = cfg["strategy"]["donchian"]
         self.entry_period = d["entry_period"]
         self.min_history = d.get("min_history", 60)
+        self.atr_trail_mult = d.get("atr_trail_mult", 3.0)
 
     def decide(self, frames: dict[str, pd.DataFrame],
                entry_period: int | None = None) -> StrategyDecision:
@@ -208,3 +209,33 @@ class DonchianStrategy:
         return StrategyDecision(
             "FLAT", 0, 1, True,
             reasoning=f"No breakout (close {close:,.0f} <= {ep}-day high {prior_high:,.0f}).")
+
+    def active_state(self, frames: dict[str, pd.DataFrame],
+                     entry_period: int | None = None) -> bool:
+        """
+        Is this coin CURRENTLY in an active Donchian trend (broke out and the
+        chandelier trail hasn't been hit since)? This is the in-position state
+        used by momentum_rotation to decide which coins are eligible to hold -
+        the live equivalent of the backtest's expo_donchian last value. It is
+        computable from history regardless of whether we actually hold the coin.
+        """
+        ep = entry_period or self.entry_period
+        df = frames.get(self.primary_tf)
+        if df is None or len(df) < max(self.min_history, ep + 5) or "atr" not in df.columns:
+            return False
+        high = df["high"].to_numpy()
+        close = df["close"].to_numpy()
+        atr = df["atr"].to_numpy()
+        prior_high = pd.Series(high).rolling(ep).max().shift(1).to_numpy()
+        inpos = False
+        peak = 0.0
+        for i in range(len(close)):
+            if not inpos:
+                if prior_high[i] == prior_high[i] and close[i] > prior_high[i]:
+                    inpos = True
+                    peak = close[i]
+            else:
+                peak = max(peak, close[i])
+                if atr[i] == atr[i] and close[i] < peak - self.atr_trail_mult * atr[i]:
+                    inpos = False
+        return inpos

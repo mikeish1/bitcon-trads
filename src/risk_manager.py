@@ -74,6 +74,14 @@ class RiskManager:
 
         self.conn = sqlite3.connect(cfg["runtime"]["db_path"], check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # WAL + a busy timeout so this bot can share one DB file with the carry/ETF
+        # sibling bots (run together via src.run_all) without "database is locked".
+        if cfg["runtime"]["db_path"] != ":memory:":
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA busy_timeout=5000")
+            except sqlite3.OperationalError:
+                pass
         self._init_db()
         self._seed()
 
@@ -235,6 +243,22 @@ class RiskManager:
         exposure_budget = max(0.0, equity * self.max_total_exposure - open_value)
         spend = min(per_asset_cap, exposure_budget, available_quote * self.max_position_pct)
         return {"spend_usd": spend, "viable": spend >= self.min_notional}
+
+    def size_rotation(self, equity: float, available_quote: float, open_value: float,
+                      top_k: int) -> dict[str, Any]:
+        """Equal-weight (1/K of equity) sizing for a momentum-rotation entry,
+        still bounded by the portfolio exposure cap and available cash."""
+        target = equity / max(top_k, 1)
+        exposure_budget = max(0.0, equity * self.max_total_exposure - open_value)
+        spend = min(target, exposure_budget, available_quote * self.max_position_pct)
+        return {"spend_usd": spend, "viable": spend >= self.min_notional}
+
+    # Small state passthrough (used by the rotation clock in the loop).
+    def state_get(self, key: str) -> Optional[str]:
+        return self._get(key)
+
+    def state_set(self, key: str, value: Any) -> None:
+        self._set(key, value)
 
     def chandelier_stop(self, peak: float, atr: float) -> float:
         return peak - self.chandelier_mult * atr

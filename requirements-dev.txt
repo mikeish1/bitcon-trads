@@ -1,0 +1,4 @@
+# Dev/test-only dependencies (not needed to run the bots).
+#   pip install -r requirements-dev.txt
+#   pytest -q
+pytest>=8.0
