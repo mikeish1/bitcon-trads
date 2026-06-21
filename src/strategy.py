@@ -188,22 +188,23 @@ class DonchianStrategy:
         self.entry_period = d["entry_period"]
         self.min_history = d.get("min_history", 60)
 
-    def decide(self, frames: dict[str, pd.DataFrame]) -> StrategyDecision:
+    def decide(self, frames: dict[str, pd.DataFrame],
+               entry_period: int | None = None) -> StrategyDecision:
+        ep = entry_period or self.entry_period  # per-asset override allowed
         df = frames.get(self.primary_tf)
-        if df is None or len(df) < max(self.min_history, self.entry_period + 5) \
-                or "atr" not in df.columns:
+        if df is None or len(df) < max(self.min_history, ep + 5) or "atr" not in df.columns:
             return StrategyDecision("FLAT", 0, 0, False,
                                     reasoning="Warming up / insufficient daily history.")
         # Prior N-day high EXCLUDING today (shift(1)) -> no lookahead.
-        prior_high = df["high"].rolling(self.entry_period).max().shift(1).iloc[-1]
+        prior_high = df["high"].rolling(ep).max().shift(1).iloc[-1]
         close = float(df.iloc[-1]["close"])
         if pd.isna(prior_high):
             return StrategyDecision("FLAT", 0, 0, True, reasoning="Donchian window not ready.")
         if close > prior_high:
             return StrategyDecision(
                 "BUY", 1, 1, True,
-                reasons=[f"Close {close:,.0f} broke {self.entry_period}-day high {prior_high:,.0f}"],
-                reasoning=f"Breakout: close {close:,.0f} > {self.entry_period}-day high {prior_high:,.0f}.")
+                reasons=[f"Close {close:,.0f} broke {ep}-day high {prior_high:,.0f}"],
+                reasoning=f"Breakout: close {close:,.0f} > {ep}-day high {prior_high:,.0f}.")
         return StrategyDecision(
             "FLAT", 0, 1, True,
-            reasoning=f"No breakout (close {close:,.0f} <= {self.entry_period}-day high {prior_high:,.0f}).")
+            reasoning=f"No breakout (close {close:,.0f} <= {ep}-day high {prior_high:,.0f}).")

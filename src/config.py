@@ -77,6 +77,21 @@ def load_config() -> dict[str, Any]:
 
     cfg["market"]["symbol"] = os.getenv("SYMBOL", default_symbol)
 
+    # --- Dynamic multi-asset universe ---
+    quote = "USD" if is_alpaca else "USDT"          # quote currency per venue
+    cfg["quote_ccy"] = quote
+    cfg.setdefault("universe", {})
+    bases_env = os.getenv("SYMBOLS")                 # e.g. "BTC,ETH,SOL"
+    if bases_env:
+        bases = [b.strip().upper() for b in bases_env.split(",") if b.strip()]
+    else:
+        bases = [str(b).upper() for b in cfg["universe"].get("bases", ["BTC"])]
+    cfg["universe"]["bases"] = bases
+    cfg["universe_symbols"] = [f"{b}/{quote}" for b in bases]
+    cfg.setdefault("portfolio", {"max_concurrent_positions": 3,
+                                 "max_total_exposure_pct": 0.90,
+                                 "per_asset_alloc_pct": 0.30})
+
     cfg["runtime"] = {
         "paper_trading": paper,
         "live_trading_enabled": live_enabled,

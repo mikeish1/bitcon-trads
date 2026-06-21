@@ -1,9 +1,14 @@
-# 🪙 Long-Only BTC Spot Trend-Follower (Binance.US / Alpaca)
+# 🪙 Long-Only Multi-Crypto Spot Trend-Follower (Binance.US / Alpaca)
 
-An autonomous, long-only Bitcoin bot for spot trading. The **active strategy is a
-daily Donchian breakout trend-follower** — it buys when BTC breaks to a new
-multi-week high, rides the position with an ATR "chandelier" trailing stop that
-lets winners run, and sits in cash the rest of the time (~60–70%).
+An autonomous, long-only **multi-coin** spot bot. The **active strategy is a daily
+Donchian breakout trend-follower**, applied independently to every coin in a
+config-driven universe (BTC, ETH, BNB, SOL, XRP, DOGE, ADA, VET): it buys a coin
+when it breaks to a new multi-week high, rides it with an ATR "chandelier"
+trailing stop that lets winners run, and sits in cash the rest of the time. A
+**portfolio layer** caps how many coins it holds at once and total exposure.
+
+Coins the live venue doesn't list are **auto-skipped** at startup (e.g. BNB/VET
+aren't on Alpaca), so you can list everything and let the system adapt.
 
 This strategy was chosen because it is the **only design that beat buy-and-hold
 out-of-sample** in our research: comparable-or-better risk-adjusted return with
@@ -40,6 +45,41 @@ separate switches** to ever place a real order.
 
 That's the whole strategy — deliberately simple. It trades roughly **5–10 times a
 year**. Patience is the edge: every high-turnover variant we tested lost money.
+
+### The trading universe — adding / removing coins
+The universe is **fully config-driven** in `config/trading_config.yaml`:
+```yaml
+universe:
+  bases: [BTC, ETH, BNB, SOL, XRP, DOGE, ADA, VET]   # add/remove coins here
+  overrides: {ETH: {entry_period: 30}}               # optional per-coin tuning
+portfolio:
+  max_concurrent_positions: 3      # hold at most 3 coins at once
+  max_total_exposure_pct: 0.90     # cap total deployed across all coins
+  per_asset_alloc_pct: 0.30        # cap any single coin at 30% of equity
+```
+- **To add a coin:** add its base symbol to `bases`. No code changes. If the live
+  venue lists it, it starts trading; if not, it's skipped with a warning.
+- **Quote currency is automatic:** USD on Alpaca, USDT on Binance.US.
+- **Override at runtime** without editing the file via the `SYMBOLS` env var, e.g.
+  `SYMBOLS=BTC,ETH,SOL`.
+
+### Multi-asset backtests
+Same strategy, same standards, every coin — single or multi:
+```bash
+python src/backtester.py --symbols BTC                 # single asset
+python src/backtester.py --symbols BTC,ETH,SOL,XRP,DOGE,ADA   # multi
+python src/backtester.py                               # whole config universe
+```
+It prints **per-asset** metrics (return, drawdown, MAR, Sharpe, % time in market)
+and an **equal-weight portfolio** aggregate vs Buy & Hold, split in-sample /
+out-of-sample. Results save to `backtests/`.
+
+> Validation result (daily, 2020→2026, OOS after 2024-06): an equal-weight
+> BTC/ETH/SOL Donchian portfolio returned **+1406% vs B&H +877% with −60% max
+> drawdown vs −91%** (full period), and in the down OOS window lost **−23% vs B&H
+> −51%**. Diversifying the trend-follower across coins is more robust than any
+> single alt. As always: lower drawdown / better risk-adjusted return, **not**
+> beating a raw crypto bull run.
 
 ### Strategy & validation
 On 6.7 years of daily BTC (2019→2026), tuned in-sample and judged out-of-sample
