@@ -224,31 +224,77 @@ limits, cooldown, max trades/day) until you fully understand them.
 
 ---
 
-## Deploy on Railway
+## Deploy on Railway (step by step)
 
-1. Push this repo to **GitHub** (private recommended).
-2. Railway → **New Project → Deploy from GitHub repo** → pick the repo (it builds
-   the `Dockerfile`).
-3. Service → **Variables** → add:
+This bot is a **background worker** — it has no website/port. Railway runs it
+24/7, restarts it automatically if it crashes, and shows you live logs. The repo
+includes a `Dockerfile` and a `railway.json` so most settings are automatic.
 
-   | Variable | Value |
-   |---|---|
-   | `EXCHANGE_ID` | `binanceus` |
-   | `PAPER_TRADING` | `true` *(keep until fully trusted)* |
-   | `LIVE_TRADING_ENABLED` | `false` |
-   | `BINANCE_API_KEY` | *(your key)* |
-   | `BINANCE_API_SECRET` | *(your secret)* |
-   | `ANTHROPIC_API_KEY` | *(optional)* |
-   | `DEFAULT_CAPITAL_USD` | `250` |
+### 1. Put the code on GitHub
+Push this repo to GitHub (private recommended). If you used GitHub Desktop,
+that's **Publish repository**.
 
-4. *(Recommended)* Add a **Volume** mounted at `/data` and set
-   `DB_PATH=/data/trading_state.db` so your trade history survives redeploys.
-5. Watch the **Logs** tab.
+### 2. Create the Railway project
+1. Go to **railway.app** → **New Project** → **Deploy from GitHub repo**.
+2. Pick this repo. Railway reads `railway.json`, builds the `Dockerfile`, and
+   starts the worker. (No "Generate Domain" needed — it's not a web app.)
 
-> ⚠️ **Railway + API key IP restriction:** Railway's outbound IP changes, so you
-> generally **cannot** IP-restrict the key there. If you go live on Railway, rely
-> on the **no-withdrawal** permission as your protection. For tighter control,
-> run live on your own PC with an IP-restricted key instead.
+### 3. Add environment variables
+Open the service → **Variables** tab → **New Variable** for each. Start in PAPER.
+
+**Alpaca paper (recommended default):**
+
+| Variable | Value |
+|---|---|
+| `EXCHANGE_ID` | `alpaca` |
+| `ALPACA_PAPER` | `true` |
+| `PAPER_TRADING` | `true` |
+| `LIVE_TRADING_ENABLED` | `false` |
+| `ALPACA_API_KEY` | *(your paper key)* |
+| `ALPACA_API_SECRET` | *(your paper secret)* |
+| `DEFAULT_CAPITAL_USD` | `250` |
+| `TELEGRAM_BOT_TOKEN` | *(optional — phone alerts)* |
+| `TELEGRAM_CHAT_ID` | *(optional)* |
+| `ANTHROPIC_API_KEY` | *(optional — daily summaries)* |
+
+**Binance.US instead** (all 8 coins, but real-money only — no paper there): set
+`EXCHANGE_ID=binanceus`, `BINANCE_API_KEY` / `BINANCE_API_SECRET`, and to trade
+the full universe set `SYMBOLS=BTC,ETH,BNB,SOL,XRP,DOGE,ADA,VET`.
+
+> Variables you set here **override** the Dockerfile and YAML defaults. You never
+> commit keys — they live only in Railway.
+
+### 4. Recommended Railway settings
+- **Replicas: exactly 1.** ⚠️ Never run 2+ — duplicate instances would place
+  duplicate orders. (`railway.json` already pins `numReplicas: 1`.)
+- **Restart policy:** `ON_FAILURE` with retries — already set in `railway.json`,
+  so a crash auto-restarts and your SQLite state resumes where it left off.
+- **Resources:** the default small instance is plenty (this is light: a few API
+  calls every 15 minutes). No GPU, no big RAM.
+- **Region:** any. (If you ever use `binanceus`, pick a US region.)
+
+### 5. Persist the database (recommended)
+So your trade history/positions survive redeploys:
+1. Service → **Variables** → add `DB_PATH` = `/data/trading_state.db`
+2. Service → **Settings → Volumes** → **New Volume**, mount path **`/data`**.
+3. Redeploy. State now lives on the volume.
+
+### 6. Monitor it
+- **Deployments → View Logs** (or the **Logs** tab) — live, searchable. You'll
+  see the startup banner, the tradable universe, the BTC regime state, per-coin
+  decisions, and any orders.
+- Set up **Telegram** (next section) for push alerts to your phone — the easiest
+  way to know it bought, sold, flipped risk-on/off, or hit an error without
+  watching logs.
+- Railway emails you if the deploy crashes/can't start.
+
+> ⚠️ **Railway + API-key IP restriction:** Railway's outbound IP changes, so you
+> generally **cannot** IP-restrict the key there. For live on Railway, rely on a
+> **no-withdrawal** key. For tighter control, run live on your own PC with an
+> IP-restricted key instead. Alpaca paper has no real money, so this is moot
+> until you go live.
+
+> 📋 **Before flipping to real money, follow [GO_LIVE_CHECKLIST.md](GO_LIVE_CHECKLIST.md).**
 
 ---
 
