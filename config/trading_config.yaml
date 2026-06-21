@@ -19,7 +19,9 @@ market:
 # not list are skipped at startup with a warning - so it's safe to list all of
 # them. Override the list at runtime with the SYMBOLS env var (e.g. "BTC,ETH,SOL").
 universe:
-  bases: [BTC, ETH, BNB, SOL, XRP, DOGE, ADA, VET]
+  # Default = the coins Alpaca (the default paper venue) supports.
+  # On Binance.US, add BNB and VET too: [BTC, ETH, BNB, SOL, XRP, DOGE, ADA, VET]
+  bases: [BTC, ETH, SOL, XRP, DOGE, ADA]
   overrides: {}              # optional per-asset tuning, e.g. {ETH: {entry_period: 30}}
 
 # --- Portfolio-level risk controls (across ALL coins) -----------------------
