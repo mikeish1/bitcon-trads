@@ -1,16 +1,17 @@
 """
-Risk manager: position sizing + safety rails + persistent state.
+Risk manager for spot, long-only trading.
 
-- Fractional Kelly position sizing with conservative caps.
-- Hard safety rails: daily loss limit, weekly loss limit, consecutive-loss
-  circuit breaker, post-trade cooldown, single-position rule.
-- All state and a full trade log are persisted in SQLite so the bot survives
-  restarts/redeploys (important on Railway).
+- Dynamic position sizing: risk a small % of portfolio equity per trade, scaled
+  by a conservative fractional-Kelly factor, sized off the ATR-based stop
+  distance. Default capital $250 in paper mode; in live mode equity is your real
+  portfolio value (USDT + BTC).
+- ATR-based initial stop, R-multiple take-profit, and ratcheting trailing stop.
+- Safety rails: daily/weekly loss limits, consecutive-loss circuit breaker,
+  post-trade cooldown, max trades/day, single position.
+- SQLite persistence so positions and stats survive restarts; plus a
+  reconcile() that compares the DB to your real balances on startup.
 
-Every decision is logged with its reasoning.
-
-A basic user does not need to change anything here - tune the numbers in
-config/trading_config.yaml instead.
+Tune numbers in config/trading_config.yaml.
 """
 from __future__ import annotations
 
@@ -28,324 +29,325 @@ def _utcnow() -> datetime:
 class RiskManager:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
-        self.db_path = cfg["runtime"]["db_path"]
-        risk, safety = cfg["risk"], cfg["safety"]
+        # uses_broker: read equity from the venue (Alpaca paper or any live).
+        # real_money: those funds are real (affects only labels/warnings).
+        self.uses_broker = cfg["runtime"]["uses_broker"]
+        self.real_money = cfg["runtime"]["real_money"]
+        r, s, e = cfg["risk"], cfg["safety"], cfg["exits"]
 
-        self.max_risk_per_trade = risk["max_risk_per_trade"]
-        self.kelly_fraction = risk["kelly_fraction"]
-        self.kelly_payoff = risk["kelly_assumed_payoff"]
-        self.min_trade_usd = risk["min_trade_usd"]
-        self.max_position_pct = risk["max_position_pct"]
-        self.stop_loss_pct = risk["stop_loss_pct"]
-        self.take_profit_pct = risk["take_profit_pct"]
+        self.default_capital = r["default_capital_usd"]
+        self.risk_per_trade = r["risk_per_trade_pct"]
+        self.max_position_pct = r["max_position_pct"]
+        self.min_notional = r["min_notional_usd"]
+        self.kelly_fraction = r["kelly_fraction"]
+        self.kelly_payoff = r["kelly_assumed_payoff"]
 
-        self.daily_loss_limit = safety["daily_loss_limit_pct"]
-        self.weekly_loss_limit = safety["weekly_loss_limit_pct"]
-        self.max_consec_losses = safety["max_consecutive_losses"]
-        self.cooldown_minutes = safety["cooldown_minutes"]
-        self.max_open_positions = safety["max_open_positions"]
+        self.atr_stop_mult = e["atr_stop_mult"]
+        self.min_stop_pct = e.get("min_stop_pct", 0.01)
+        self.atr_trail_mult = e["atr_trail_mult"]
+        self.take_profit_R = e["take_profit_R"]
+        self.stop_limit_offset = e["stop_limit_offset_pct"]
+        # Donchian trend-follower: chandelier trail multiplier (falls back to ATR trail).
+        dn = cfg.get("strategy", {}).get("donchian", {})
+        self.chandelier_mult = dn.get("atr_trail_mult", self.atr_trail_mult)
 
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.daily_loss_limit = s["daily_loss_limit_pct"]
+        self.weekly_loss_limit = s["weekly_loss_limit_pct"]
+        self.max_consec_losses = s["max_consecutive_losses"]
+        self.cooldown_minutes = s["cooldown_minutes"]
+        self.max_trades_per_day = s["max_trades_per_day"]
+
+        self.conn = sqlite3.connect(cfg["runtime"]["db_path"], check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
-        self._seed_state(risk["starting_capital_usd"])
+        self._seed()
 
-    # ------------------------------------------------------------------ #
-    # Database setup                                                      #
     # ------------------------------------------------------------------ #
     def _init_db(self) -> None:
         self.conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS state (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
+            CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                opened_at TEXT,
-                closed_at TEXT,
-                side TEXT,
-                entry_price REAL,
-                exit_price REAL,
-                qty REAL,
-                notional_usd REAL,
-                stop_price REAL,
-                take_price REAL,
-                pnl_usd REAL,
-                status TEXT,           -- OPEN / CLOSED
-                mode TEXT,             -- PAPER / LIVE
-                reason TEXT
+                opened_at TEXT, closed_at TEXT,
+                entry_price REAL, exit_price REAL,
+                qty REAL, cost_usd REAL, entry_fee REAL, exit_fee REAL,
+                stop_price REAL, take_price REAL, current_stop REAL, peak_price REAL,
+                stop_order_id TEXT,
+                pnl_usd REAL, status TEXT, mode TEXT, reason TEXT
             );
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT,
-                direction TEXT,
-                agreement INTEGER,
-                consulted_claude INTEGER,
-                action TEXT,
-                reasoning TEXT
+                ts TEXT, action TEXT, conviction INTEGER,
+                consulted_claude INTEGER, reasoning TEXT
             );
             """
         )
+        # Migrate older DBs that predate the peak_price column.
+        cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(trades)")]
+        if "peak_price" not in cols:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN peak_price REAL")
         self.conn.commit()
 
-    def _seed_state(self, starting_capital: float) -> None:
-        if self._get("equity") is None:
+    def _seed(self) -> None:
+        if self._get("paper_equity") is None:
             now = _utcnow()
-            self._set("equity", starting_capital)
-            self._set("starting_equity", starting_capital)
-            self._set("day_start_equity", starting_capital)
+            self._set("paper_equity", self.default_capital)
             self._set("day_date", now.date().isoformat())
-            self._set("week_start_equity", starting_capital)
-            self._set("week_number", f"{now.isocalendar().year}-{now.isocalendar().week}")
+            self._set("day_start_equity", self.default_capital)
+            self._set("week_id", f"{now.isocalendar().year}-{now.isocalendar().week}")
+            self._set("week_start_equity", self.default_capital)
             self._set("consecutive_losses", 0)
             self._set("wins", 0)
             self._set("losses", 0)
             self._set("last_close_ts", "")
-            logger.info("Initialised state with starting equity ${:.2f}", starting_capital)
+            logger.info("State seeded. Paper equity ${:.2f}.", self.default_capital)
 
     # ------------------------------------------------------------------ #
-    # State helpers                                                       #
-    # ------------------------------------------------------------------ #
-    def _get(self, key: str) -> Optional[str]:
-        row = self.conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    def _get(self, k: str) -> Optional[str]:
+        row = self.conn.execute("SELECT value FROM state WHERE key=?", (k,)).fetchone()
         return row["value"] if row else None
 
-    def _set(self, key: str, value: Any) -> None:
+    def _set(self, k: str, v: Any) -> None:
         self.conn.execute(
             "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
-        )
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
         self.conn.commit()
 
-    def _getf(self, key: str, default: float = 0.0) -> float:
-        v = self._get(key)
+    def _getf(self, k: str, d: float = 0.0) -> float:
+        v = self._get(k)
         try:
-            return float(v) if v is not None else default
+            return float(v) if v is not None else d
         except ValueError:
-            return default
+            return d
 
-    def _geti(self, key: str, default: int = 0) -> int:
-        return int(self._getf(key, default))
-
-    @property
-    def equity(self) -> float:
-        return self._getf("equity")
+    def _geti(self, k: str, d: int = 0) -> int:
+        return int(self._getf(k, d))
 
     # ------------------------------------------------------------------ #
-    # Period rollover (daily / weekly)                                   #
+    # Equity                                                            #
     # ------------------------------------------------------------------ #
-    def _roll_periods(self) -> None:
+    def current_equity(self, balances: dict[str, float], price: float) -> float:
+        """Broker (Alpaca paper / live): real account value. Else: simulated equity."""
+        if self.uses_broker:
+            return balances.get("USDT", 0.0) + balances.get("BTC", 0.0) * price
+        return self._getf("paper_equity", self.default_capital)
+
+    def _roll_periods(self, equity: float) -> None:
         now = _utcnow()
         today = now.date().isoformat()
         if self._get("day_date") != today:
             self._set("day_date", today)
-            self._set("day_start_equity", self.equity)
-            logger.info("New day - daily loss limit reset.")
+            self._set("day_start_equity", equity)
+            logger.info("New UTC day - daily limit + trade count reset.")
+        wk = f"{now.isocalendar().year}-{now.isocalendar().week}"
+        if self._get("week_id") != wk:
+            self._set("week_id", wk)
+            self._set("week_start_equity", equity)
+            logger.info("New ISO week - weekly limit reset.")
 
-        week_id = f"{now.isocalendar().year}-{now.isocalendar().week}"
-        if self._get("week_number") != week_id:
-            self._set("week_number", week_id)
-            self._set("week_start_equity", self.equity)
-            logger.info("New week - weekly loss limit reset.")
+    def _trades_today(self) -> int:
+        today = _utcnow().date().isoformat()
+        row = self.conn.execute(
+            "SELECT COUNT(*) c FROM trades WHERE substr(opened_at,1,10)=?", (today,)).fetchone()
+        return int(row["c"])
 
     # ------------------------------------------------------------------ #
-    # Safety gate                                                         #
+    # Safety gate                                                        #
     # ------------------------------------------------------------------ #
-    def can_open_trade(self) -> tuple[bool, str]:
-        """Return (allowed, reason). Checks every safety rail."""
-        self._roll_periods()
-
+    def can_open_trade(self, equity: float) -> tuple[bool, str]:
+        self._roll_periods(equity)
         if self.open_position() is not None:
-            return False, "A position is already open (max_open_positions reached)."
+            return False, "position already open"
 
-        # Daily loss limit
-        day_start = self._getf("day_start_equity", self.equity)
-        if day_start > 0:
-            day_dd = (self.equity - day_start) / day_start
-            if day_dd <= -self.daily_loss_limit:
-                return False, (
-                    f"Daily loss limit hit ({day_dd:.2%} <= -{self.daily_loss_limit:.2%}). "
-                    "Flat until tomorrow (UTC)."
-                )
-
-        # Weekly loss limit
-        week_start = self._getf("week_start_equity", self.equity)
-        if week_start > 0:
-            week_dd = (self.equity - week_start) / week_start
-            if week_dd <= -self.weekly_loss_limit:
-                return False, (
-                    f"Weekly loss limit hit ({week_dd:.2%} <= -{self.weekly_loss_limit:.2%}). "
-                    "Flat until next week (UTC)."
-                )
-
-        # Consecutive-loss circuit breaker
+        day_start = self._getf("day_start_equity", equity)
+        if day_start > 0 and (equity - day_start) / day_start <= -self.daily_loss_limit:
+            return False, f"daily loss limit ({(equity/day_start-1):.2%})"
+        week_start = self._getf("week_start_equity", equity)
+        if week_start > 0 and (equity - week_start) / week_start <= -self.weekly_loss_limit:
+            return False, f"weekly loss limit ({(equity/week_start-1):.2%})"
         if self._geti("consecutive_losses") >= self.max_consec_losses:
-            return False, (
-                f"Circuit breaker: {self._geti('consecutive_losses')} consecutive losses "
-                f">= {self.max_consec_losses}. Manual review recommended."
-            )
-
-        # Cooldown after the last close
-        last_close = self._get("last_close_ts")
-        if last_close:
+            return False, f"circuit breaker ({self._geti('consecutive_losses')} losses in a row)"
+        if self._trades_today() >= self.max_trades_per_day:
+            return False, f"max trades/day reached ({self.max_trades_per_day})"
+        last = self._get("last_close_ts")
+        if last:
             try:
-                elapsed = (_utcnow() - datetime.fromisoformat(last_close)).total_seconds() / 60
-                if elapsed < self.cooldown_minutes:
-                    return False, (
-                        f"Cooldown active ({elapsed:.0f}/{self.cooldown_minutes} min)."
-                    )
+                mins = (_utcnow() - datetime.fromisoformat(last)).total_seconds() / 60
+                if mins < self.cooldown_minutes:
+                    return False, f"cooldown ({mins:.0f}/{self.cooldown_minutes} min)"
             except ValueError:
                 pass
-
-        return True, "All safety checks passed."
+        return True, "ok"
 
     # ------------------------------------------------------------------ #
-    # Position sizing (fractional Kelly)                                  #
+    # Sizing                                                             #
     # ------------------------------------------------------------------ #
-    def _dynamic_win_rate(self) -> float:
-        wins, losses = self._geti("wins"), self._geti("losses")
-        total = wins + losses
-        # Bayesian-ish prior of 50% until we have a track record.
-        if total < 10:
-            return 0.5
-        return wins / total
+    def _win_rate(self) -> float:
+        w, l = self._geti("wins"), self._geti("losses")
+        return 0.5 if (w + l) < 10 else w / (w + l)
 
-    def compute_position(self, price: float) -> dict[str, Any]:
+    def size_buy(self, equity: float, available_usdt: float,
+                 price: float, atr: float) -> dict[str, Any]:
         """
-        Fractional-Kelly position sizing.
+        Dynamic fractional-Kelly sizing off the ATR stop distance.
 
-        risk_fraction = clamp( kelly_fraction * max(kelly*, 0), 0, max_risk_per_trade )
-        notional      = equity * risk_fraction / stop_loss_pct   (so a stop ~= risk_fraction loss)
-        capped by max_position_pct of equity.
+        stop_distance = atr_stop_mult * ATR
+        risk_amount   = equity * risk_fraction   (~loss if the stop is hit)
+        spend         = risk_amount * price / stop_distance, capped by USDT.
         """
-        equity = self.equity
-        win = self._dynamic_win_rate()
-        payoff = self.kelly_payoff
-        kelly_star = win - (1.0 - win) / payoff      # classic Kelly fraction
-        kelly_star = max(kelly_star, 0.0)
+        # ATR-based, but floored at min_stop_pct so a tiny 5m ATR can't create a
+        # noise-tight stop that whipsaws us out instantly.
+        stop_distance = max(self.atr_stop_mult * atr, price * self.min_stop_pct)
+        stop_price = price - stop_distance
 
-        risk_fraction = min(self.kelly_fraction * kelly_star, self.max_risk_per_trade)
-        # Never risk literally zero just because the prior is exactly break-even;
-        # use a tiny floor so a valid 28/31 signal can still take a measured position.
-        risk_fraction = max(risk_fraction, self.max_risk_per_trade * 0.25)
+        win = self._win_rate()
+        kelly_star = max(win - (1.0 - win) / self.kelly_payoff, 0.0)
+        risk_fraction = min(self.kelly_fraction * kelly_star, self.risk_per_trade)
+        risk_fraction = max(risk_fraction, self.risk_per_trade * 0.25)  # small floor
 
-        notional = equity * risk_fraction / max(self.stop_loss_pct, 1e-6)
-        notional = min(notional, equity * self.max_position_pct)
-        qty = notional / price if price > 0 else 0.0
+        risk_amount = equity * risk_fraction
+        spend = risk_amount * price / stop_distance
 
+        # With a real (or paper-broker) account we can't spend more cash than we hold.
+        cap = available_usdt * self.max_position_pct if self.uses_broker else equity * self.max_position_pct
+        spend = min(spend, cap)
+
+        take_price = price + self.take_profit_R * stop_distance
         return {
-            "equity": equity,
-            "win_rate": win,
-            "kelly_star": kelly_star,
+            "spend_usd": spend,
+            "stop_price": stop_price,
+            "take_price": take_price,
+            "stop_distance": stop_distance,
             "risk_fraction": risk_fraction,
-            "notional_usd": notional,
-            "qty": qty,
-            "viable": notional >= self.min_trade_usd,
+            "win_rate": win,
+            "viable": spend >= self.min_notional,
         }
 
-    def stop_and_target(self, side: str, entry: float) -> tuple[float, float]:
-        if side == "LONG":
-            return entry * (1 - self.stop_loss_pct), entry * (1 + self.take_profit_pct)
-        return entry * (1 + self.stop_loss_pct), entry * (1 - self.take_profit_pct)
+    def trailing_stop(self, price: float, atr: float) -> float:
+        return price - max(self.atr_trail_mult * atr, price * self.min_stop_pct)
+
+    # --- Donchian trend-follower helpers ---
+    def chandelier_stop(self, peak: float, atr: float) -> float:
+        """Exit level = highest close held minus chandelier_mult x ATR."""
+        return peak - self.chandelier_mult * atr
+
+    def size_full(self, equity: float, available_usdt: float) -> dict[str, Any]:
+        """Full allocation (the trend-follower is binary long/flat; the trail is the stop)."""
+        cash = available_usdt if self.uses_broker else equity
+        spend = cash * self.max_position_pct
+        return {"spend_usd": spend, "viable": spend >= self.min_notional}
+
+    def update_trail(self, trade_id: int, peak: float, stop: float,
+                     stop_order_id: Optional[str]) -> None:
+        self.conn.execute(
+            "UPDATE trades SET peak_price=?, current_stop=?, stop_order_id=? WHERE id=?",
+            (peak, stop, stop_order_id, trade_id))
+        self.conn.commit()
+
+    def stop_limit_price(self, stop_price: float) -> float:
+        """Limit price sits just below the stop trigger to improve fill odds."""
+        return stop_price * (1 - self.stop_limit_offset)
 
     # ------------------------------------------------------------------ #
-    # Trade lifecycle                                                    #
+    # Position lifecycle                                                 #
     # ------------------------------------------------------------------ #
     def open_position(self) -> Optional[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+            "SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1").fetchone()
 
-    def record_open(
-        self, side: str, entry: float, qty: float, notional: float,
-        stop: float, take: float, mode: str, reason: str,
-    ) -> int:
+    def record_open(self, fill: dict[str, Any], stop_price: float, take_price: float,
+                    stop_order_id: Optional[str], reason: str,
+                    peak_price: Optional[float] = None) -> int:
+        mode = "LIVE" if self.real_money else "PAPER"
+        peak = peak_price if peak_price is not None else fill["price"]
         cur = self.conn.execute(
-            "INSERT INTO trades(opened_at, side, entry_price, qty, notional_usd, "
-            "stop_price, take_price, status, mode, reason) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (_utcnow().isoformat(), side, entry, qty, notional, stop, take, "OPEN", mode, reason),
-        )
+            "INSERT INTO trades(opened_at, entry_price, qty, cost_usd, entry_fee, "
+            "stop_price, take_price, current_stop, peak_price, stop_order_id, status, mode, reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_utcnow().isoformat(), fill["price"], fill["qty"], fill["cost"], fill["fee"],
+             stop_price, take_price, stop_price, peak, stop_order_id, "OPEN", mode, reason))
         self.conn.commit()
-        logger.info(
-            "OPENED {} {:.6f} @ {:.2f} (notional ${:.2f}, stop {:.2f}, target {:.2f}) [{}]",
-            side, qty, entry, notional, stop, take, mode,
-        )
+        logger.info("OPENED LONG {:.6f} BTC @ {:.2f} | stop {:.2f} | target {:.2f} [{}]",
+                    fill["qty"], fill["price"], stop_price, take_price, mode)
         return int(cur.lastrowid)
 
-    def record_close(self, trade_id: int, exit_price: float, reason: str) -> float:
-        row = self.conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
-        if row is None:
-            return 0.0
+    def update_stop(self, trade_id: int, new_stop: float, stop_order_id: Optional[str]) -> None:
+        self.conn.execute("UPDATE trades SET current_stop=?, stop_order_id=? WHERE id=?",
+                          (new_stop, stop_order_id, trade_id))
+        self.conn.commit()
 
-        side, entry, qty = row["side"], row["entry_price"], row["qty"]
-        fee_pct = self.cfg["execution"]["taker_fee_pct"]
-        gross = (exit_price - entry) * qty if side == "LONG" else (entry - exit_price) * qty
-        fees = (entry + exit_price) * qty * fee_pct
-        pnl = gross - fees
-
+    def record_close(self, trade: sqlite3.Row, exit_price: float,
+                     exit_fee: float, reason: str) -> float:
+        entry, qty = trade["entry_price"], trade["qty"]
+        entry_fee = trade["entry_fee"] or 0.0
+        pnl = (exit_price - entry) * qty - entry_fee - exit_fee
         self.conn.execute(
-            "UPDATE trades SET closed_at=?, exit_price=?, pnl_usd=?, status='CLOSED', "
-            "reason=? WHERE id=?",
-            (_utcnow().isoformat(), exit_price, pnl, reason, trade_id),
-        )
+            "UPDATE trades SET closed_at=?, exit_price=?, exit_fee=?, pnl_usd=?, "
+            "status='CLOSED', reason=? WHERE id=?",
+            (_utcnow().isoformat(), exit_price, exit_fee, pnl, reason, trade["id"]))
 
-        new_equity = self.equity + pnl
-        self._set("equity", new_equity)
+        if not self.uses_broker:
+            self._set("paper_equity", self._getf("paper_equity") + pnl)
         self._set("last_close_ts", _utcnow().isoformat())
-
         if pnl >= 0:
             self._set("wins", self._geti("wins") + 1)
             self._set("consecutive_losses", 0)
         else:
             self._set("losses", self._geti("losses") + 1)
             self._set("consecutive_losses", self._geti("consecutive_losses") + 1)
-
         self.conn.commit()
-        logger.info(
-            "CLOSED {} @ {:.2f} | PnL ${:.2f} | equity ${:.2f} | reason: {}",
-            side, exit_price, pnl, new_equity, reason,
-        )
+        logger.info("CLOSED LONG @ {:.2f} | PnL ${:.2f} | reason: {}", exit_price, pnl, reason)
         return pnl
 
-    def log_decision(
-        self, direction: str, agreement: int, consulted: bool, action: str, reasoning: str
-    ) -> None:
+    def log_decision(self, action: str, conviction: int, consulted: bool, reasoning: str) -> None:
         self.conn.execute(
-            "INSERT INTO decisions(ts, direction, agreement, consulted_claude, action, reasoning) "
-            "VALUES(?,?,?,?,?,?)",
-            (_utcnow().isoformat(), direction, agreement, int(consulted), action, reasoning),
-        )
+            "INSERT INTO decisions(ts, action, conviction, consulted_claude, reasoning) "
+            "VALUES(?,?,?,?,?)",
+            (_utcnow().isoformat(), action, conviction, int(consulted), reasoning))
         self.conn.commit()
 
     # ------------------------------------------------------------------ #
-    # Reporting                                                          #
+    # Startup reconciliation                                             #
     # ------------------------------------------------------------------ #
-    def daily_stats(self) -> dict[str, Any]:
-        self._roll_periods()
-        day_start = self._getf("day_start_equity", self.equity)
-        week_start = self._getf("week_start_equity", self.equity)
-        start = self._getf("starting_equity", self.equity)
+    def reconcile(self, balances: dict[str, float], price: float) -> None:
+        """Compare the DB's idea of our position to real balances (broker only)."""
+        if not self.uses_broker:
+            return
+        pos = self.open_position()
+        btc = balances.get("BTC", 0.0)
+        dust = self.min_notional / price if price else 0.0
+
+        if pos is not None and btc < dust:
+            # We thought we held BTC, but it's gone - the exchange stop likely
+            # filled while we were offline. Close the books at the recorded stop.
+            logger.warning("Reconcile: open trade in DB but no BTC on exchange - "
+                           "closing it (stop likely filled offline).")
+            self.record_close(pos, pos["current_stop"] or price, 0.0, "offline stop fill")
+        elif pos is None and btc >= dust:
+            logger.warning("Reconcile: {:.6f} BTC on exchange but no tracked position. "
+                           "Leaving it untouched - sell manually if unexpected.", btc)
+
+    # ------------------------------------------------------------------ #
+    def daily_stats(self, equity: float) -> dict[str, Any]:
+        self._roll_periods(equity)
+        day_start = self._getf("day_start_equity", equity)
+        week_start = self._getf("week_start_equity", equity)
         today = self._get("day_date")
-        closed_today = self.conn.execute(
+        closed = self.conn.execute(
             "SELECT COUNT(*) c, COALESCE(SUM(pnl_usd),0) p FROM trades "
-            "WHERE status='CLOSED' AND substr(closed_at,1,10)=?",
-            (today,),
-        ).fetchone()
+            "WHERE status='CLOSED' AND substr(closed_at,1,10)=?", (today,)).fetchone()
         return {
             "date_utc": today,
-            "equity": round(self.equity, 2),
-            "starting_equity": round(start, 2),
-            "total_return_pct": round((self.equity / start - 1) * 100, 2) if start else 0,
-            "day_pnl_usd": round(self.equity - day_start, 2),
-            "day_return_pct": round((self.equity / day_start - 1) * 100, 2) if day_start else 0,
-            "week_return_pct": round((self.equity / week_start - 1) * 100, 2) if week_start else 0,
-            "trades_closed_today": closed_today["c"],
-            "pnl_closed_today_usd": round(closed_today["p"], 2),
+            "mode": "LIVE" if self.real_money else "PAPER",
+            "equity": round(equity, 2),
+            "day_return_pct": round((equity / day_start - 1) * 100, 2) if day_start else 0,
+            "week_return_pct": round((equity / week_start - 1) * 100, 2) if week_start else 0,
+            "trades_today": self._trades_today(),
+            "closed_today": closed["c"],
+            "pnl_today_usd": round(closed["p"], 2),
             "wins": self._geti("wins"),
             "losses": self._geti("losses"),
             "consecutive_losses": self._geti("consecutive_losses"),
-            "win_rate": round(self._dynamic_win_rate() * 100, 1),
+            "win_rate_pct": round(self._win_rate() * 100, 1),
         }
