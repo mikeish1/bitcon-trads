@@ -143,3 +143,78 @@ claude:
 
 logging:
   level: "INFO"
+
+# --- Funding-rate carry (delta-neutral; SIBLING strategy, OFF by default) -----
+# Long spot + short perp on the SAME coin to harvest funding. Delta-neutral: P&L
+# is funding income minus fees/basis, NOT price direction. USA-legal via
+# CFTC-regulated perps (e.g. Kraken Futures / Bitnomial). Runs in its OWN process
+# (`python -m src.carry.main`); it never touches the Donchian spot bot. Paper-first:
+# `execution.mode: sim` simulates fills against LIVE funding/prices and sends no
+# orders. Real orders need CARRY_ENABLED=true AND the two-key tripwire. See
+# docs/CARRY_ARBITRAGE.md. Flip fast via env vars (CARRY_*).
+carry:
+  enabled: false
+  assets: [BTC, ETH, SOL]          # must be listed on BOTH the spot and perp venue
+  venues:
+    spot: "kraken"                 # ccxt id for the long spot leg
+    perp: "krakenfutures"          # ccxt id for the short perpetual leg
+  poll_seconds: 900                # 8h funding cycle -> 15-min polling is plenty
+  funding_interval_hours: 8        # venue funding interval (used to annualise)
+  signal:
+    min_entry_apr: 0.08            # OPEN only if NET annualised carry >= 8%
+    min_hold_apr: 0.02             # comfortable hold zone: funding >= this resets the unwind counter
+    unwind_apr: -0.01              # tolerance band: only funding BELOW this (can be slightly
+                                   #   negative) counts toward an unwind - avoids churn when
+                                   #   funding chops around zero (a round trip costs ~0.4%)
+    flip_confirm_reads: 3          # need this many consecutive sub-band polls before unwinding
+    funding_lookback: 9            # smooth funding over last N history reads (~3d @8h)
+    max_basis_bps: 75              # skip entry if |perp-spot| basis wider than this
+    expected_hold_days: 30         # amortise round-trip fees over this horizon
+  capital:
+    sleeve_usd: 1000.0             # TOTAL capital across both venues (paper sleeve)
+    per_asset_cap_usd: 400.0       # max spot notional per asset
+    min_notional_usd: 25.0
+  risk:
+    target_leverage: 1.0           # perp notional / futures collateral (low = safe)
+    max_leverage: 2.0
+    margin_alert_ratio: 0.40       # warn/de-risk if futures margin ratio below this
+    delta_tolerance_pct: 0.03      # flag if spot vs perp qty drift > 3% (partial fills)
+    daily_loss_limit_usd: 50.0     # circuit breaker (basis blowups / funding flips)
+    max_feed_staleness_seconds: 120
+  execution:
+    mode: "sim"                    # "sim" (paper, live data) | "live" (needs tripwire)
+    taker_fee_pct: 0.0005          # per-leg taker fee assumption
+    paper_slippage_pct: 0.0005     # simulated slippage per leg in sim mode
+
+# --- ETF cross-sectional momentum (US equities/ETFs; SIBLING strategy, OFF) ----
+# REUSES the same validated engine as the crypto bot - Donchian breakout trend
+# filter (src/strategy.py) + top-K momentum rotation (src/momentum_allocator.py) -
+# applied to a US ETF universe via Alpaca. Long-only, low-frequency (rebalances
+# every N days) so it fits the synchronous loop. USA-legal, commission-free. Runs
+# in its OWN process (`python -m src.etf.main`), SIM by default. Flip fast with
+# ETF_* env vars. See docs/ETF_MOMENTUM.md.
+etf:
+  enabled: false
+  venue: "alpaca"                  # "alpaca" (alpaca-py: real US equities) | a ccxt id
+  alpaca_feed: "iex"               # Alpaca data feed: "iex" (free) | "sip" (paid)
+  primary_timeframe: "1d"
+  backfill_days: 400               # daily bars on startup (~1.6y; warms indicators)
+  poll_seconds: 3600               # daily strategy; hourly poll is ample
+  # Diversified, liquid ETFs across asset classes (equities/intl/bonds/gold/cmdty/RE).
+  universe: [SPY, QQQ, IWM, EFA, EEM, TLT, IEF, GLD, DBC, VNQ]
+  selection:
+    entry_period: 40               # Donchian breakout window (the trend filter)
+    atr_trail_mult: 3.0            # chandelier used by active_state (same as crypto)
+    min_history: 60                # need this many daily bars before trading
+    top_k: 5                       # hold the K strongest eligible ETFs
+    rebalance_days: 5              # rotate at most weekly
+    lookback_days: 90              # momentum = close / close N days ago - 1
+    keep_band: 1                   # rank hysteresis (keep until rank > top_k+band)
+  capital:
+    sleeve_usd: 2000.0             # paper sleeve (siloed from crypto equity)
+    max_total_exposure_pct: 0.95   # cap total deployed across all ETFs
+    min_notional_usd: 10.0
+  execution:
+    mode: "sim"                    # "sim" (paper ledger, live prices) | "live" (tripwire)
+    taker_fee_pct: 0.0             # Alpaca equities are commission-free
+    paper_slippage_pct: 0.0005

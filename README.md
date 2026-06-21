@@ -374,6 +374,51 @@ or just clear the token.
 
 ---
 
+## Sibling strategy: funding-rate carry (delta-neutral, optional)
+
+A second, independent bot ships alongside the spot trend-follower: a
+**delta-neutral funding-rate carry** (long spot + short perp on the same coin to
+harvest funding). It is **USA-legal** via CFTC-regulated perps (e.g. Kraken
+Futures), runs in its **own process**, and never touches the Donchian bot. It is
+**SIM (paper) by default** and reuses the same two-key tripwire.
+
+```bash
+# paper (live funding/prices, no orders) — safe to run now:
+python -m src.carry.main
+
+# research backtest on real funding history (never trades):
+python -m src.carry.backtester --assets BTC,ETH,SOL
+```
+
+Config lives in the `carry:` block of `config/trading_config.yaml`; keys/overrides
+are in `.env` (`CARRY_*`, `KRAKEN_*`, `KRAKENFUTURES_*`). Going live needs
+`CARRY_ENABLED=true` **and** `PAPER_TRADING=false` **and**
+`LIVE_TRADING_ENABLED=true` **and** `carry.execution.mode: live`. Full design,
+risks, and capital model: **[docs/CARRY_ARBITRAGE.md](docs/CARRY_ARBITRAGE.md)**.
+
+> On Railway, run it as a **second** single-replica worker (separate service,
+> start command `python -m src.carry.main`). Tests: `pip install -r
+> requirements-dev.txt && pytest -q`.
+
+## Sibling strategy: ETF cross-sectional momentum (optional)
+
+A third, independent bot **reuses this repo's validated engine** — the Donchian
+trend filter (`src/strategy.py`) + top-K momentum rotation
+(`src/momentum_allocator.py`) — pointed at a **US ETF universe** via Alpaca
+(stocks/bonds/gold/commodities). Long-only, commission-free, USA-legal, and it
+**diversifies the crypto book**. Its own process, SIM by default.
+
+```bash
+python -m src.etf.main                                   # paper (live prices, no orders)
+python -m src.etf.backtester --universe SPY,QQQ,TLT,GLD  # research backtest
+```
+
+Config: the `etf:` block of `config/trading_config.yaml` (overrides via `ETF_*`).
+**Live US equities** run through the official `alpaca-py` adapter — `pip install
+-r requirements-etf.txt`, then `ETF_EXECUTION_MODE=live` places real **paper**
+orders on Alpaca (real money also needs the two-key tripwire + `ALPACA_PAPER=false`).
+Full design + the live tiers: **[docs/ETF_MOMENTUM.md](docs/ETF_MOMENTUM.md)**.
+
 ## FAQ
 
 **Why does it almost never trade?** That's the point — it only takes

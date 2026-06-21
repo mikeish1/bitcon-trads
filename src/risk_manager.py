@@ -74,6 +74,14 @@ class RiskManager:
 
         self.conn = sqlite3.connect(cfg["runtime"]["db_path"], check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # WAL + a busy timeout so this bot can share one DB file with the carry/ETF
+        # sibling bots (run together via src.run_all) without "database is locked".
+        if cfg["runtime"]["db_path"] != ":memory:":
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA busy_timeout=5000")
+            except sqlite3.OperationalError:
+                pass
         self._init_db()
         self._seed()
 
