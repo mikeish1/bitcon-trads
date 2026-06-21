@@ -7,14 +7,27 @@
 # =============================================================================
 
 market:
-  symbol: "BTC/USDT"          # Binance.US spot pair (buy BTC with USDT)
-  primary_timeframe: "5m"     # entry-trigger timeframe (the heartbeat)
-  confirm_timeframes: ["15m", "1h"]   # higher timeframes used for trend gates
-  backfill_candles: 400       # history per timeframe on startup (indicator warm-up)
-  poll_seconds: 60            # how often the loop wakes up
+  symbol: "BTC/USDT"          # spot pair (BTC/USD on Alpaca). Buy BTC with cash.
+  primary_timeframe: "1d"     # DAILY base timeframe for the trend-follower
+  confirm_timeframes: []      # donchian mode uses a single timeframe
+  backfill_candles: 400       # daily candles on startup (~1.1y; warms indicators)
+  poll_seconds: 900           # check every 15 min (a daily strategy needs no faster)
 
-# --- High-conviction long logic ---------------------------------------------
+# --- Strategy selection -----------------------------------------------------
 strategy:
+  # "donchian"        = VALIDATED daily breakout trend-follower (recommended).
+  # "high_conviction" = the old 5m multi-timeframe system (validated unprofitable;
+  #                     kept for reference only - needs 5m/15m/1h timeframes above).
+  mode: "donchian"
+
+  # --- Donchian breakout trend-follower (the active strategy) ---
+  donchian:
+    entry_period: 40          # buy when daily close > highest high of prior 40 days
+    atr_period: 14            # ATR window for the trailing exit
+    atr_trail_mult: 3.0       # exit when close falls 3 x ATR below highest close held
+    min_history: 60           # need this many daily candles before trading
+
+# --- High-conviction long logic (ONLY used when strategy.mode=high_conviction) -
   # LAYER 1 - Hard gates. ALL must pass or the bot stays flat.
   gates:
     htf_ema_period: 200       # 1h close must be above this EMA (established uptrend)

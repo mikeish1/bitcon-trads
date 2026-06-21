@@ -167,3 +167,43 @@ class Strategy:
             "stoch_turning_up": _v(p, "stoch_k") > _v(p, "stoch_d") and _v(p, "stoch_k") < 80,
             "momentum_positive": _v(p, "roc_5") > 0,
         }
+
+
+class DonchianStrategy:
+    """
+    Validated daily breakout trend-follower.
+
+    Entry  : daily close breaks above the highest high of the prior `entry_period`
+             days (a fresh N-day high = momentum/strength).
+    Exit   : handled by the risk manager's ATR chandelier trail (exit when close
+             falls atr_trail_mult x ATR below the highest close held). No fixed
+             target - winners are allowed to run.
+
+    This strategy only signals ENTRIES; the loop + risk manager handle the trail.
+    """
+    def __init__(self, cfg: dict[str, Any], claude_orchestrator: Any | None = None):
+        self.cfg = cfg
+        self.primary_tf = cfg["market"]["primary_timeframe"]
+        d = cfg["strategy"]["donchian"]
+        self.entry_period = d["entry_period"]
+        self.min_history = d.get("min_history", 60)
+
+    def decide(self, frames: dict[str, pd.DataFrame]) -> StrategyDecision:
+        df = frames.get(self.primary_tf)
+        if df is None or len(df) < max(self.min_history, self.entry_period + 5) \
+                or "atr" not in df.columns:
+            return StrategyDecision("FLAT", 0, 0, False,
+                                    reasoning="Warming up / insufficient daily history.")
+        # Prior N-day high EXCLUDING today (shift(1)) -> no lookahead.
+        prior_high = df["high"].rolling(self.entry_period).max().shift(1).iloc[-1]
+        close = float(df.iloc[-1]["close"])
+        if pd.isna(prior_high):
+            return StrategyDecision("FLAT", 0, 0, True, reasoning="Donchian window not ready.")
+        if close > prior_high:
+            return StrategyDecision(
+                "BUY", 1, 1, True,
+                reasons=[f"Close {close:,.0f} broke {self.entry_period}-day high {prior_high:,.0f}"],
+                reasoning=f"Breakout: close {close:,.0f} > {self.entry_period}-day high {prior_high:,.0f}.")
+        return StrategyDecision(
+            "FLAT", 0, 1, True,
+            reasoning=f"No breakout (close {close:,.0f} <= {self.entry_period}-day high {prior_high:,.0f}).")

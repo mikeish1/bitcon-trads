@@ -47,6 +47,9 @@ class RiskManager:
         self.atr_trail_mult = e["atr_trail_mult"]
         self.take_profit_R = e["take_profit_R"]
         self.stop_limit_offset = e["stop_limit_offset_pct"]
+        # Donchian trend-follower: chandelier trail multiplier (falls back to ATR trail).
+        dn = cfg.get("strategy", {}).get("donchian", {})
+        self.chandelier_mult = dn.get("atr_trail_mult", self.atr_trail_mult)
 
         self.daily_loss_limit = s["daily_loss_limit_pct"]
         self.weekly_loss_limit = s["weekly_loss_limit_pct"]
@@ -69,7 +72,7 @@ class RiskManager:
                 opened_at TEXT, closed_at TEXT,
                 entry_price REAL, exit_price REAL,
                 qty REAL, cost_usd REAL, entry_fee REAL, exit_fee REAL,
-                stop_price REAL, take_price REAL, current_stop REAL,
+                stop_price REAL, take_price REAL, current_stop REAL, peak_price REAL,
                 stop_order_id TEXT,
                 pnl_usd REAL, status TEXT, mode TEXT, reason TEXT
             );
@@ -80,6 +83,10 @@ class RiskManager:
             );
             """
         )
+        # Migrate older DBs that predate the peak_price column.
+        cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(trades)")]
+        if "peak_price" not in cols:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN peak_price REAL")
         self.conn.commit()
 
     def _seed(self) -> None:
@@ -220,6 +227,24 @@ class RiskManager:
     def trailing_stop(self, price: float, atr: float) -> float:
         return price - max(self.atr_trail_mult * atr, price * self.min_stop_pct)
 
+    # --- Donchian trend-follower helpers ---
+    def chandelier_stop(self, peak: float, atr: float) -> float:
+        """Exit level = highest close held minus chandelier_mult x ATR."""
+        return peak - self.chandelier_mult * atr
+
+    def size_full(self, equity: float, available_usdt: float) -> dict[str, Any]:
+        """Full allocation (the trend-follower is binary long/flat; the trail is the stop)."""
+        cash = available_usdt if self.uses_broker else equity
+        spend = cash * self.max_position_pct
+        return {"spend_usd": spend, "viable": spend >= self.min_notional}
+
+    def update_trail(self, trade_id: int, peak: float, stop: float,
+                     stop_order_id: Optional[str]) -> None:
+        self.conn.execute(
+            "UPDATE trades SET peak_price=?, current_stop=?, stop_order_id=? WHERE id=?",
+            (peak, stop, stop_order_id, trade_id))
+        self.conn.commit()
+
     def stop_limit_price(self, stop_price: float) -> float:
         """Limit price sits just below the stop trigger to improve fill odds."""
         return stop_price * (1 - self.stop_limit_offset)
@@ -232,14 +257,16 @@ class RiskManager:
             "SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC LIMIT 1").fetchone()
 
     def record_open(self, fill: dict[str, Any], stop_price: float, take_price: float,
-                    stop_order_id: Optional[str], reason: str) -> int:
+                    stop_order_id: Optional[str], reason: str,
+                    peak_price: Optional[float] = None) -> int:
         mode = "LIVE" if self.real_money else "PAPER"
+        peak = peak_price if peak_price is not None else fill["price"]
         cur = self.conn.execute(
             "INSERT INTO trades(opened_at, entry_price, qty, cost_usd, entry_fee, "
-            "stop_price, take_price, current_stop, stop_order_id, status, mode, reason) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "stop_price, take_price, current_stop, peak_price, stop_order_id, status, mode, reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (_utcnow().isoformat(), fill["price"], fill["qty"], fill["cost"], fill["fee"],
-             stop_price, take_price, stop_price, stop_order_id, "OPEN", mode, reason))
+             stop_price, take_price, stop_price, peak, stop_order_id, "OPEN", mode, reason))
         self.conn.commit()
         logger.info("OPENED LONG {:.6f} BTC @ {:.2f} | stop {:.2f} | target {:.2f} [{}]",
                     fill["qty"], fill["price"], stop_price, take_price, mode)

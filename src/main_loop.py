@@ -33,7 +33,7 @@ from src.data_pipeline import DataPipeline, build_exchange
 from src.executor import SpotExecutor
 from src.notifications import Notifier
 from src.risk_manager import RiskManager
-from src.strategy import Strategy
+from src.strategy import Strategy, DonchianStrategy
 
 
 class TradingBot:
@@ -59,7 +59,13 @@ class TradingBot:
         self.exchange = build_exchange(self.cfg)
         self.data = DataPipeline(self.cfg, self.exchange)
         self.claude = ClaudeOrchestrator(self.cfg)
-        self.strategy = Strategy(self.cfg, claude_orchestrator=self.claude)
+        self.strategy_mode = self.cfg["strategy"].get("mode", "high_conviction")
+        if self.strategy_mode == "donchian":
+            self.strategy = DonchianStrategy(self.cfg)
+            logger.info("Strategy: DONCHIAN daily breakout trend-follower.")
+        else:
+            self.strategy = Strategy(self.cfg, claude_orchestrator=self.claude)
+            logger.info("Strategy: high-conviction multi-timeframe (legacy).")
         self.risk = RiskManager(self.cfg)
         self.executor = SpotExecutor(self.cfg, self.exchange)
         self.notifier = Notifier(self.cfg)
@@ -97,10 +103,14 @@ class TradingBot:
             logger.error("Startup data/reconcile failed: {}. Exiting.", exc)
             return
 
-        logger.info("Ready. Need ALL gates + >= {} of 8 triggers to buy. Risk/trade {:.2%}, "
-                    "default capital ${:.0f}.",
-                    self.cfg["strategy"]["triggers"]["min_required"],
-                    self.cfg["risk"]["risk_per_trade_pct"], self.cfg["risk"]["default_capital_usd"])
+        if self.strategy_mode == "donchian":
+            d = self.cfg["strategy"]["donchian"]
+            logger.info("Ready. Buy on a {}-day high breakout; exit on a {}x ATR chandelier "
+                        "trail. Default capital ${:.0f}.",
+                        d["entry_period"], d["atr_trail_mult"], self.cfg["risk"]["default_capital_usd"])
+        else:
+            logger.info("Ready. High-conviction mode. Default capital ${:.0f}.",
+                        self.cfg["risk"]["default_capital_usd"])
 
         self.notifier.startup(self.cfg["runtime"]["exchange_id"],
                               self.cfg["market"]["symbol"], self._mode)
@@ -169,20 +179,39 @@ class TradingBot:
             return
 
         available_usdt = balances.get("USDT", 0.0) if self.cfg["runtime"]["uses_broker"] else equity
+
+        if self.strategy_mode == "donchian":
+            sizing = self.risk.size_full(equity, available_usdt)
+            if not sizing["viable"]:
+                logger.info("BUY skipped: size ${:.2f} below minimum.", sizing["spend_usd"])
+                return
+            fill = self.executor.market_buy(sizing["spend_usd"], price)
+            if fill is None:
+                return
+            stop0 = self.risk.chandelier_stop(fill["price"], atr)   # peak == entry at open
+            stop_order_id = None
+            if self.use_exchange_stop:
+                stop_order_id = self.executor.place_stop_limit_sell(
+                    fill["qty"], stop0, self.risk.stop_limit_price(stop0))
+            self.risk.record_open(fill, stop0, 0.0, stop_order_id, decision.reasoning,
+                                  peak_price=fill["price"])  # take=0 -> no fixed target
+            self._cb_notified = False
+            self.notifier.entry(fill["price"], fill["qty"], fill["cost"], stop0, 0.0,
+                                decision.reasoning)
+            return
+
+        # --- high-conviction (legacy) sizing + ATR-stop/target ---
         sizing = self.risk.size_buy(equity, available_usdt, price, atr)
         if not sizing["viable"]:
             logger.info("BUY skipped: size ${:.2f} below minimum.", sizing["spend_usd"])
             return
-
         fill = self.executor.market_buy(sizing["spend_usd"], price)
         if fill is None:
             return
-
         stop_order_id = None
         if self.use_exchange_stop:
             stop_order_id = self.executor.place_stop_limit_sell(
                 fill["qty"], sizing["stop_price"], self.risk.stop_limit_price(sizing["stop_price"]))
-
         reason = (f"conviction {decision.conviction}/{decision.triggers_required}, "
                   f"risk {sizing['risk_fraction']:.2%}")
         self.risk.record_open(fill, sizing["stop_price"], sizing["take_price"],
@@ -203,6 +232,24 @@ class TradingBot:
             if balances.get("BTC", 0.0) < dust and pos["qty"] > dust:
                 self.risk.record_close(pos, pos["current_stop"] or price, 0.0, "exchange stop filled")
                 return
+
+        # --- Donchian: ATR chandelier trail off the highest close held ---
+        if self.strategy_mode == "donchian":
+            prev_stop = pos["current_stop"] or pos["stop_price"]
+            peak = max(pos["peak_price"] or pos["entry_price"], price)
+            new_stop = self.risk.chandelier_stop(peak, atr) if atr > 0 else prev_stop
+            current_stop = max(prev_stop, new_stop)  # never lower the stop
+            sid = pos["stop_order_id"]
+            if (self.cfg["runtime"]["place_orders"] and self.use_exchange_stop
+                    and current_stop > prev_stop * 1.001):
+                self.executor.cancel(pos["stop_order_id"])
+                sid = self.executor.place_stop_limit_sell(
+                    pos["qty"], current_stop, self.risk.stop_limit_price(current_stop))
+                logger.info("Chandelier trail raised {:.2f} -> {:.2f}", prev_stop, current_stop)
+            self.risk.update_trail(pos["id"], peak, current_stop, sid)
+            if price <= current_stop:
+                self._exit(pos, price, "chandelier trail")
+            return
 
         current_stop = pos["current_stop"] or pos["stop_price"]
 

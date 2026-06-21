@@ -1,11 +1,22 @@
-# 🪙 Binance.US Spot — High-Conviction Long-Only BTC Bot
+# 🪙 Long-Only BTC Spot Trend-Follower (Binance.US / Alpaca)
 
-An autonomous, **very conservative** Bitcoin bot for **Binance.US spot**. It buys
-BTC with USDT **only on high-conviction long setups** confirmed across multiple
-timeframes, protects every position with a stop, and otherwise **stays flat**.
+An autonomous, long-only Bitcoin bot for spot trading. The **active strategy is a
+daily Donchian breakout trend-follower** — it buys when BTC breaks to a new
+multi-week high, rides the position with an ATR "chandelier" trailing stop that
+lets winners run, and sits in cash the rest of the time (~60–70%).
+
+This strategy was chosen because it is the **only design that beat buy-and-hold
+out-of-sample** in our research: comparable-or-better risk-adjusted return with
+roughly **half the drawdown** (~−30% vs BTC's ~−77%). It **will not** out-return
+a raging bull market — its edge is downside protection and risk-adjusted growth,
+not beating BTC's raw return. See "Strategy & validation" below.
 
 It **defaults to PAPER mode** (simulated, no real money) and requires **two
 separate switches** to ever place a real order.
+
+> An older "high-conviction" 5-minute multi-timeframe strategy also ships
+> (`strategy.mode: high_conviction`) but was validated **unprofitable** and is off
+> by default. The section below it describes that legacy mode.
 
 > ⚠️ **Risk warning — read this.** Crypto trading can lose money, up to your
 > entire balance. This software has **no guarantee of profit**, may contain bugs,
@@ -16,23 +27,31 @@ separate switches** to ever place a real order.
 
 ---
 
-## What it does (plain English)
+## What it does (plain English) — active Donchian trend-follower
 
-1. Every ~60 seconds it pulls BTC/USDT candles on **5m, 15m and 1h** from Binance.US.
-2. It only considers buying when **all** of these are true (the "gates"):
-   - **1h** is in a real uptrend (price above its 50 & 200 EMAs, ADX > 25, +DI > −DI)
-   - **15m** agrees (price above its 50 EMA)
-   - Market structure shows **higher highs and higher lows**
-3. Then it needs a **cluster of bullish triggers** on the 5m candle (RSI pullback
-   in the uptrend, MACD turning up, volume confirmation, pullback to a rising EMA,
-   etc.) — at least **6 of 8** must fire.
-4. Any **bearish veto** (overbought RSI, negative 1h momentum) cancels the setup.
-5. Optionally, **Claude** gives a final yes/no on borderline setups.
-6. On a buy it sizes the position **dynamically** (risk ~1% of equity, based on the
-   ATR stop distance), places an **exchange-side stop**, then **trails the stop up**
-   with ATR as price rises. It exits on the trailing stop or take-profit.
+1. Once a day it pulls **daily** BTC candles.
+2. **Entry:** if today's close is a fresh **40-day high** (a breakout = momentum),
+   it buys with (almost) all available cash.
+3. **Exit:** it tracks the highest close since you bought and exits when price
+   falls **3 × ATR** below that high (a "chandelier" trailing stop). There is **no
+   fixed profit target** — winners are allowed to run.
+4. The rest of the time it holds **cash**. It's in the market only ~30–40% of the
+   time, which is how it sidesteps the worst crashes.
 
-Because the bar is so high, **it will stay flat most of the time. That is by design.**
+That's the whole strategy — deliberately simple. It trades roughly **5–10 times a
+year**. Patience is the edge: every high-turnover variant we tested lost money.
+
+### Strategy & validation
+On 6.7 years of daily BTC (2019→2026), tuned in-sample and judged out-of-sample
+against Buy & Hold, DCA, and an MA filter, the Donchian breakout + ATR trail was
+the **only** strategy that beat buy-and-hold out-of-sample on risk-adjusted terms,
+with ~half the drawdown. The research tools are included:
+```
+python src/strategy_search.py       # leaderboard of strategy families (OOS-ranked)
+python src/regime_backtester.py     # baselines: B&H / DCA / MA filter
+```
+Honest expectation: it aims to **match BTC's upside with much lower drawdown and
+win in choppy/bear markets** — not to beat BTC's raw return in a bull run.
 
 ---
 
