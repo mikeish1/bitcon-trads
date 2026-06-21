@@ -433,4 +433,30 @@ proceed on the rule engine, and you get no daily summary. Everything else works.
 offline. The trailing (ratcheting the stop upward) only happens while the bot runs.
 
 **Where are my trades recorded?** In the SQLite file at `DB_PATH` — tables
-`trades`, `decisions`, `state`.
+`trades`, `decisions`, `state` (the carry/ETF bots use their own tables in the
+same file).
+
+---
+
+## Development & PR workflow
+
+Run the test suite (offline; no keys or network needed):
+```bash
+pip install -r requirements-dev.txt      # pytest
+pip install -r requirements-etf.txt      # only if touching the ETF bot (alpaca-py)
+pytest -q
+```
+
+Changes go through a pull request rather than committing to `main` directly:
+```bash
+git checkout -b my-change
+# ...edit, then make sure pytest -q is green...
+git commit -am "Describe the change"
+git push -u origin my-change
+gh pr create --base main --fill          # opens the PR (prints its URL)
+gh pr merge --squash --delete-branch     # merge once reviewed / CI-green
+```
+All bots default to **paper/sim**; real orders require the two-key tripwire
+(`PAPER_TRADING=false` + `LIVE_TRADING_ENABLED=true`) **plus** each bot's own
+`*_ENABLED` + live execution mode. See **[docs/DEPLOY.md](docs/DEPLOY.md)** for
+running them together via the `RUN_BOTS` supervisor.
