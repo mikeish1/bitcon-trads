@@ -68,6 +68,10 @@ class RiskManager:
         self.max_total_exposure = pf.get("max_total_exposure_pct", 0.90)
         self.per_asset_alloc = pf.get("per_asset_alloc_pct", 0.30)
 
+        vt = cfg.get("strategy", {}).get("vol_target", {})
+        self.vol_target_enabled = vt.get("enabled", False)
+        self.vol_target_daily = vt.get("target_daily_vol", 0.04)
+
         self.conn = sqlite3.connect(cfg["runtime"]["db_path"], check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_db()
@@ -221,9 +225,13 @@ class RiskManager:
     # ------------------------------------------------------------------ #
     # Sizing                                                             #
     # ------------------------------------------------------------------ #
-    def size_for_asset(self, equity: float, available_quote: float, open_value: float) -> dict[str, Any]:
+    def size_for_asset(self, equity: float, available_quote: float, open_value: float,
+                       atr_pct: float | None = None) -> dict[str, Any]:
         """Portfolio-aware allocation for one new position (trend-follower)."""
         per_asset_cap = equity * self.per_asset_alloc
+        if self.vol_target_enabled and atr_pct and atr_pct > 0:
+            # Shrink size for coins more volatile than target (clamp 0.2x..1x).
+            per_asset_cap *= min(1.0, max(0.2, self.vol_target_daily / atr_pct))
         exposure_budget = max(0.0, equity * self.max_total_exposure - open_value)
         spend = min(per_asset_cap, exposure_budget, available_quote * self.max_position_pct)
         return {"spend_usd": spend, "viable": spend >= self.min_notional}

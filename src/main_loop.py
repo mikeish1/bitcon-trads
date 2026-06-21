@@ -69,6 +69,11 @@ class TradingBot:
         self.poll_seconds = self.cfg["market"]["poll_seconds"]
         self.use_exchange_stop = self.cfg["exits"]["use_exchange_stop"]
         self.overrides = self.cfg["universe"].get("overrides", {}) or {}
+        sd = self.cfg["strategy"]
+        self.regime_enabled = sd.get("btc_regime", {}).get("enabled", False)
+        self.regime_ma = sd.get("btc_regime", {}).get("ma_period", 100)
+        self._btc_risk_on = True
+        self._quote = self.cfg.get("quote_ccy", "USDT")
         self.running = True
         self._last_candle_ts: dict[str, Any] = {}
         self._last_summary_day: Optional[str] = None
@@ -150,6 +155,7 @@ class TradingBot:
         snap: dict[str, dict] = {}   # symbol -> {frames, price, atr, candle_ts}
         prices: dict[str, float] = {}
 
+        # Pass 1: gather data for every symbol (no trading yet).
         for sym in self.symbols:
             try:
                 frames = self.data.get_frames(sym)
@@ -161,9 +167,14 @@ class TradingBot:
             atr = float(last["atr"]) if "atr" in last and last["atr"] == last["atr"] else 0.0
             snap[sym] = {"frames": frames, "price": price, "atr": atr, "ts": last["timestamp"]}
             prices[_base_of(sym)] = price
-            # Manage an open position for this symbol every tick.
+
+        # Market regime: is BTC in an uptrend? (gates entries + forces risk-off exits)
+        self._update_regime(snap)
+
+        # Pass 2: manage open positions (now that regime is known).
+        for sym, s in snap.items():
             if self.risk.open_position(sym) is not None:
-                self._manage(sym, price, atr, balances)
+                self._manage(sym, s["price"], s["atr"], balances)
 
         equity = self.risk.current_equity(balances, prices)
         avail_quote = self.risk.available_quote(balances)
@@ -191,7 +202,28 @@ class TradingBot:
                 avail_quote -= opened
 
     # ------------------------------------------------------------------ #
+    def _update_regime(self, snap: dict[str, dict]) -> None:
+        if not self.regime_enabled:
+            self._btc_risk_on = True
+            return
+        btc_sym = f"BTC/{self._quote}"
+        try:
+            bf = (snap[btc_sym]["frames"][self.primary_tf] if btc_sym in snap
+                  else self.data.get_frames(btc_sym)[self.primary_tf])
+            ma = bf["close"].rolling(self.regime_ma).mean().iloc[-1]
+            on = True if ma != ma else bool(bf.iloc[-1]["close"] > ma)
+        except Exception as exc:
+            logger.warning("BTC regime check failed ({}); assuming risk-on.", exc)
+            on = True
+        if on != self._btc_risk_on:
+            state = "RISK-ON (BTC uptrend)" if on else "RISK-OFF (BTC below MA)"
+            logger.warning("Market regime -> {}", state)
+            self.notifier.error(f"Market regime: {state}")
+        self._btc_risk_on = on
+
     def _try_enter(self, sym, s, equity, avail_quote, open_value, n_open) -> float:
+        if self.regime_enabled and not self._btc_risk_on:
+            return 0.0  # market risk-off: no new entries
         ep = self.overrides.get(_base_of(sym), {}).get("entry_period")
         if self.strategy_mode == "donchian":
             decision = self.strategy.decide(s["frames"], entry_period=ep)
@@ -210,7 +242,8 @@ class TradingBot:
                 self._cb_notified = True
             return 0.0
 
-        sizing = self.risk.size_for_asset(equity, avail_quote, open_value)
+        atr_pct = (s["atr"] / s["price"]) if s["price"] else None
+        sizing = self.risk.size_for_asset(equity, avail_quote, open_value, atr_pct=atr_pct)
         if not sizing["viable"]:
             logger.info("{} BUY skipped: size ${:.2f} below min / exposure cap.", sym, sizing["spend_usd"])
             return 0.0
@@ -243,6 +276,11 @@ class TradingBot:
                 self.risk.record_close(pos, pos["current_stop"] or price, 0.0, "exchange stop filled")
                 self.notifier.exit(pos["current_stop"] or price, 0.0, f"{sym}: exchange stop filled")
                 return
+
+        # Market risk-off: BTC below its regime MA -> exit everything.
+        if self.regime_enabled and not self._btc_risk_on:
+            self._exit(sym, pos, price, "BTC risk-off")
+            return
 
         prev_stop = pos["current_stop"] or pos["stop_price"]
         peak = max(pos["peak_price"] or pos["entry_price"], price)

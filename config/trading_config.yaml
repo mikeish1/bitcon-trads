@@ -44,6 +44,20 @@ strategy:
     atr_trail_mult: 3.0       # exit when close falls 3 x ATR below highest close held
     min_history: 60           # need this many daily candles before trading
 
+  # --- Market regime filter (validated improvement) ---
+  # Only buy a coin while BTC itself is in an uptrend (BTC close > its MA), and
+  # exit all positions when BTC drops below it. Alts are ~0.8 correlated to BTC,
+  # so this cuts failed-breakout whipsaw in BTC downtrends. Big risk-adjusted win.
+  btc_regime:
+    enabled: true
+    ma_period: 100
+
+  # --- Volatility-targeted sizing (optional; ~neutral in tests, default off) ---
+  # When on, coins more volatile than target_daily_vol get a smaller allocation.
+  vol_target:
+    enabled: false
+    target_daily_vol: 0.04
+
 # --- High-conviction long logic (ONLY used when strategy.mode=high_conviction) -
   # LAYER 1 - Hard gates. ALL must pass or the bot stays flat.
   gates:

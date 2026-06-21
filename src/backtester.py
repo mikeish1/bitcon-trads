@@ -57,13 +57,16 @@ def _daily(base: str, years: float, exchange: str) -> pd.DataFrame:
     return df
 
 
-def _run_asset(df: pd.DataFrame, entry: int, atr_mult: float,
-               capital: float, fee: float, slip: float) -> tuple[Run, Run, np.ndarray, np.ndarray]:
+def _run_asset(df: pd.DataFrame, entry: int, atr_mult: float, capital: float, fee: float,
+               slip: float, regime_on: pd.Series | None = None) -> tuple[Run, Run, np.ndarray, np.ndarray]:
     """Return (strategy_run, buyhold_run, close, timestamps) for one asset."""
     close = df["close"].to_numpy()
     d = {"close": close, "high_s": df["high"], "low_s": df["low"], "close_s": df["close"],
          "atr": ta.volatility.average_true_range(df["high"], df["low"], df["close"], 14).to_numpy()}
     expo = expo_donchian(d, {"entry": entry, "exit": 999, "atr_mult": atr_mult})
+    if regime_on is not None:  # gate: only long while BTC is in an uptrend
+        idx = pd.DatetimeIndex(df["timestamp"]).tz_convert("UTC").tz_localize(None)
+        expo = expo * regime_on.reindex(idx, method="ffill").fillna(0).to_numpy()
     strat = simulate("Donchian", expo, close, capital, fee, slip)
     bh = simulate("Buy & Hold", np.ones(len(close)), close, capital, fee, slip)
     ts = pd.DatetimeIndex(df["timestamp"]).tz_convert("UTC").tz_localize(None).to_numpy()
@@ -113,6 +116,22 @@ def main() -> None:
         logger.error("No data for any requested asset.")
         return
 
+    # Optional BTC regime filter (matches live config).
+    rg = cfg["strategy"].get("btc_regime", {})
+    regime_on = None
+    if rg.get("enabled"):
+        btc = frames.get("BTC")
+        if btc is None:
+            try:
+                btc = _daily("BTC", args.years, args.exchange)
+            except Exception:
+                btc = None
+        if btc is not None:
+            ro = btc["close"] > btc["close"].rolling(rg.get("ma_period", 100)).mean()
+            regime_on = pd.Series(ro.to_numpy(),
+                                  index=pd.DatetimeIndex(btc["timestamp"]).tz_convert("UTC").tz_localize(None)).astype(float)
+            logger.info("BTC regime filter ON (MA {}).", rg.get("ma_period", 100))
+
     split = np.datetime64(pd.Timestamp(args.split))
     lines: list[str] = []
 
@@ -120,13 +139,15 @@ def main() -> None:
     per_capital = capital / len(bases)
     aligned_equity: dict[str, pd.Series] = {}
     aligned_bh: dict[str, pd.Series] = {}
+    aligned_expo: dict[str, pd.Series] = {}
+    aligned_sw: dict[str, pd.Series] = {}
     lines.append("")
     lines.append("=" * 92)
     lines.append(f"  PER-ASSET  (OOS = after {args.split})")
     lines.append("=" * 92)
     lines.append(f"  {'Asset':<8}{'Window':<10}{HDR}")
     for b in bases:
-        strat, bh, close, ts = _run_asset(frames[b], entry, atr_mult, per_capital, fee, slip)
+        strat, bh, close, ts = _run_asset(frames[b], entry, atr_mult, per_capital, fee, slip, regime_on)
         oos = ts > split
         full = np.ones(len(ts), bool)
         m_oos = metrics(strat, oos, close)
@@ -139,31 +160,27 @@ def main() -> None:
         idx = pd.DatetimeIndex(frames[b]["timestamp"]).tz_convert("UTC").tz_localize(None)
         aligned_equity[b] = pd.Series(strat.equity, index=idx)
         aligned_bh[b] = pd.Series(bh.equity, index=idx)
+        aligned_expo[b] = pd.Series(strat.exposure, index=idx)
+        aligned_sw[b] = pd.Series(strat.switch, index=idx)
     lines.append("=" * 92)
 
-    # ---- Equal-weight portfolio over the COMMON date range ----
-    common = None
-    for b in bases:
-        common = aligned_equity[b].index if common is None else common.intersection(aligned_equity[b].index)
-    if common is not None and len(common) > 60:
-        port_eq = sum(aligned_equity[b].loc[common].to_numpy() for b in bases)
-        port_bh = sum(aligned_bh[b].loc[common].to_numpy() for b in bases)
-        # Aggregate exposure/switches = mean / sum across assets (re-derive per-asset runs on common).
-        expo_stack, sw_stack = [], []
-        for b in bases:
-            sub = frames[b].set_index(
-                pd.DatetimeIndex(frames[b]["timestamp"]).tz_convert("UTC").tz_localize(None)).loc[common].reset_index(drop=True)
-            d = {"close": sub["close"].to_numpy(), "high_s": sub["high"], "low_s": sub["low"],
-                 "close_s": sub["close"],
-                 "atr": ta.volatility.average_true_range(sub["high"], sub["low"], sub["close"], 14).to_numpy()}
-            e = expo_donchian(d, {"entry": entry, "exit": 999, "atr_mult": atr_mult})
-            r = simulate(b, e, sub["close"].to_numpy(), per_capital, fee, slip)
-            expo_stack.append(r.exposure); sw_stack.append(r.switch)
-        agg = Run("Portfolio", np.asarray(port_eq),
-                  np.mean(expo_stack, axis=0), np.sum(sw_stack, axis=0), np.zeros(len(common)))
-        agg_bh = Run("Agg Buy&Hold", np.asarray(port_bh),
-                     np.ones(len(common)), np.zeros(len(common)), np.zeros(len(common)))
-        cts = common.to_numpy()
+    # ---- Equal-weight portfolio on a CONTINUOUS daily calendar ----
+    # (Forward-fill through delisting gaps like XRP's, so the aggregate equity
+    #  curve is chronological and CAGR annualizes by real calendar time.)
+    cstart = max(s.index.min() for s in aligned_equity.values())
+    cend = min(s.index.max() for s in aligned_equity.values())
+    cal = pd.date_range(cstart, cend, freq="D")
+    if len(cal) > 60:
+        eqs = [aligned_equity[b].reindex(cal, method="ffill").to_numpy() for b in bases]
+        bhs = [aligned_bh[b].reindex(cal, method="ffill").to_numpy() for b in bases]
+        expos = [aligned_expo[b].reindex(cal, method="ffill").fillna(0).to_numpy() for b in bases]
+        sws = [aligned_sw[b].reindex(cal).fillna(0).to_numpy() for b in bases]
+        port_eq = np.sum(eqs, axis=0)
+        port_bh = np.sum(bhs, axis=0)
+        agg = Run("Portfolio", port_eq, np.mean(expos, axis=0), np.sum(sws, axis=0), np.zeros(len(cal)))
+        agg_bh = Run("Agg Buy&Hold", port_bh, np.ones(len(cal)), np.zeros(len(cal)), np.zeros(len(cal)))
+        common = cal
+        cts = cal.to_numpy()
         masks = [("IN-SAMPLE", cts <= split), ("OUT-OF-SAMPLE", cts > split), ("FULL", np.ones(len(cts), bool))]
         lines.append("")
         lines.append("=" * 92)
