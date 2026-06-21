@@ -63,6 +63,38 @@ portfolio:
 - **Override at runtime** without editing the file via the `SYMBOLS` env var, e.g.
   `SYMBOLS=BTC,ETH,SOL`.
 
+### Allocation mode — how capital is spread across the universe
+The Donchian breakout decides *when* each coin is in a trend; the **allocation
+mode** decides *which* trending coins actually get your capital. Two modes:
+```yaml
+strategy:
+  allocation:
+    mode: "first_come"        # "first_come" (default) | "momentum_rotation"
+    momentum_rotation:
+      top_k: 4                # hold the 4 strongest active coins at once
+      rebalance_days: 2       # rotate at most every N days (RISK exits still any day)
+      lookback_days: 90       # momentum = close / close N days ago - 1
+      keep_band: 1            # hysteresis: keep a held coin until rank > top_k+keep_band
+```
+- **`first_come` (default):** every coin that breaks out is sized independently
+  under the `portfolio` caps above, in iteration order. This is the original,
+  validated behavior — unchanged.
+- **`momentum_rotation`:** instead of first-come, hold only the **K strongest**
+  coins (by N-day momentum) that are currently in an active Donchian trend,
+  rotating at most every `rebalance_days`. Risk exits (chandelier trail, BTC
+  risk-off, exchange stops) still fire any day. In out-of-sample research
+  (`src/momentum_final.py`) this was a **higher risk-adjusted allocator across
+  market regimes** — it turned a ~flat baseline into a clear OOS gain and survived
+  stressed fee/slippage assumptions — but it is a **bigger behavioral change** and
+  trades more, so **paper-test it first.** It auto-raises
+  `max_concurrent_positions` to `top_k` if lower. Flip it fast without editing
+  YAML via the `ALLOCATION_MODE=momentum_rotation` env var.
+
+  > Live deviation: the live loop does *whole-position* rotation (enter the
+  > strongest, exit drop-outs, let winners run) rather than re-weighting every
+  > holding back to 1/K each period as the backtest does — lower turnover, but a
+  > slight fidelity gap, so judge it on its paper run, not the backtest number.
+
 ### Multi-asset backtests
 Same strategy, same standards, every coin — single or multi:
 ```bash
@@ -138,19 +170,24 @@ win in choppy/bear markets** — not to beat BTC's raw return in a bull run.
 
 ```
 config/trading_config.yaml   # all tunable settings (safe defaults)
-src/config.py                # loads YAML + env vars
-src/data_pipeline.py         # Binance.US data (5m/15m/1h) + balances
-src/strategy.py              # the high-conviction long gate/trigger engine
+src/config.py                # loads YAML + env vars (incl. ALLOCATION_MODE)
+src/data_pipeline.py         # per-asset candles + indicators (incl. ATR) + balances
+src/strategy.py              # DonchianStrategy (entry + active_state); legacy hi-conviction
+src/momentum_allocator.py    # momentum_rotation selector (top-K by momentum)
 src/risk_manager.py          # dynamic sizing + ATR stops + safety rails + state
-src/executor.py              # Binance.US order placement (+ paper simulation)
+src/executor.py              # order placement (+ paper simulation)
 src/claude_orchestrator.py   # optional Claude yes/no + daily summary
-src/main_loop.py             # the autonomous heartbeat
-src/backtester.py            # (older long/short backtester — see note below)
-```
+src/main_loop.py             # the autonomous heartbeat (first_come / momentum_rotation)
 
-> **Note:** `src/backtester.py` reflects the *previous* long/short logic, not the
-> new long-only rules. It still runs for rough exploration; a rebuild for the new
-> strategy is a planned separate step.
+# Research only (never trade; OOS-judged) — see "Strategy & validation":
+src/backtester.py            # multi-asset daily Donchian portfolio
+src/regime_backtester.py     # baselines: B&H / DCA / MA filter
+src/strategy_search.py       # leaderboard of strategy families
+src/improve_backtest.py      # A/B/C: baseline / +regime / +vol-target
+src/profit_taking_research.py# scale-out/ratchet + momentum vs baseline
+src/momentum_controls.py     # momentum controls (vs none/weakest) + param sweeps
+src/momentum_final.py        # final: best momentum config + walk-forward by regime
+```
 
 ---
 

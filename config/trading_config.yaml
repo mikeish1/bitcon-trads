@@ -58,6 +58,23 @@ strategy:
     enabled: false
     target_daily_vol: 0.04
 
+  # --- Allocation mode: HOW capital is deployed across the universe -----------
+  # first_come        = current live behavior. Every coin that breaks out is sized
+  #                     independently (per_asset_alloc / max_total caps), in order.
+  # momentum_rotation = hold only the K STRONGEST coins (by N-day momentum) that
+  #                     have an active Donchian trend, rotating every rebalance_days.
+  #                     Validated OOS as a higher risk-adjusted allocator (see
+  #                     src/momentum_final.py), but it is a real behavioural change
+  #                     vs first_come - PAPER-TEST it first. OFF by default.
+  # Override fast with the ALLOCATION_MODE env var (e.g. on Railway).
+  allocation:
+    mode: "first_come"        # "first_come" (default) | "momentum_rotation"
+    momentum_rotation:
+      top_k: 4                # hold the 4 strongest active coins at once
+      rebalance_days: 2       # rotate at most every N days (RISK exits still any day)
+      lookback_days: 90       # momentum = close / close N days ago - 1
+      keep_band: 1            # hysteresis: keep a held coin until rank > top_k+keep_band
+
 # --- High-conviction long logic (ONLY used when strategy.mode=high_conviction) -
   # LAYER 1 - Hard gates. ALL must pass or the bot stays flat.
   gates:
