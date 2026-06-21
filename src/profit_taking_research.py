@@ -212,11 +212,32 @@ def equalweight_portfolio(runs: dict[str, Run], frames: dict[str, pd.DataFrame],
 # --------------------------------------------------------------------------- #
 # C. Cross-sectional momentum: hold the top-K active coins, daily-rebalanced.  #
 # --------------------------------------------------------------------------- #
+def _zscore_at(rows: list[np.ndarray], cand: list[int], i: int) -> dict[int, float]:
+    """Cross-sectional z-score of each component (rows) over candidate columns at
+    day i, summed is left to the caller. Returns {component_index_in_rows-agnostic}
+    ... actually returns {j: [z_per_component]} via a dict keyed by candidate j."""
+    out: dict[int, list[float]] = {j: [] for j in cand}
+    for arr in rows:
+        vals = [arr[i, j] for j in cand]
+        finite = [v for v in vals if v == v]
+        if len(finite) >= 2:
+            mean = sum(finite) / len(finite)
+            std = (sum((v - mean) ** 2 for v in finite) / len(finite)) ** 0.5
+        else:
+            mean, std = 0.0, 0.0
+        for j in cand:
+            v = arr[i, j]
+            out[j].append(((v - mean) / std) if (std > 0 and v == v) else 0.0)
+    return out
+
+
 def momentum_topk(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
                   regime_on: pd.Series | None, capital: float, fee: float, slip: float,
                   topk: int, mom_lookback: int, name: str,
                   rebalance_every: int = 1, keep_band: int = 0,
-                  rank_mode: str = "mom") -> tuple[Run, Run, np.ndarray]:
+                  rank_mode: str = "mom", roc_short: int = 20,
+                  comp_weights: dict[str, float] | None = None,
+                  btc_base: str = "BTC") -> tuple[Run, Run, np.ndarray]:
     """
     Cross-sectional momentum, daily-rebalanced by default but with two turnover
     controls so it isn't a churn mirage:
@@ -227,22 +248,41 @@ def momentum_topk(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
                         slips below topk+keep_band (avoids swapping on tiny
                         rank flips). 0 = no hysteresis.
 
+    rank_mode : "mom"  -> rank by N-day ROC (the validated control).
+                "weak" -> weakest first (falsification control).
+                "none" -> fixed index order (no momentum info).
+                "composite" -> rank by a z-scored blend of breakout strength, long
+                               ROC, short ROC, relative strength vs BTC, and inverse
+                               ATR (mirrors MomentumRotation's composite scoring).
+
     Risk is never deferred: a held coin whose Donchian/trail signal turns OFF
     (or regime-off) is exited the SAME day, regardless of the rebalance clock.
     """
     bases = list(frames.keys())
     close_s, active_s, mom_s = {}, {}, {}
+    # Extra component series only needed for the composite ranker.
+    brk_s, invv_s, rocS_s = {}, {}, {}
     for b in bases:
         df = frames[b]
         idx = _idx(df)
+        atr = _atr(df)
         d = {"close": df["close"].to_numpy(), "high_s": df["high"], "low_s": df["low"],
-             "close_s": df["close"], "atr": _atr(df)}
+             "close_s": df["close"], "atr": atr}
         active = expo_donchian(d, {"entry": entry, "exit": 999, "atr_mult": atr_mult})
         active = active * _regime_array(regime_on, df)
         mom = (df["close"] / df["close"].shift(mom_lookback) - 1.0).to_numpy()
         close_s[b] = pd.Series(df["close"].to_numpy(), index=idx)
         active_s[b] = pd.Series(active, index=idx)
         mom_s[b] = pd.Series(mom, index=idx)
+        if rank_mode == "composite":
+            prior_high = df["high"].rolling(entry).max().shift(1).to_numpy()
+            with np.errstate(divide="ignore", invalid="ignore"):
+                brk = np.where(atr > 0, (df["close"].to_numpy() - prior_high) / atr, np.nan)
+                invv = np.where(atr > 0, df["close"].to_numpy() / atr, np.nan)
+            rocS = (df["close"] / df["close"].shift(roc_short) - 1.0).to_numpy()
+            brk_s[b] = pd.Series(brk, index=idx)
+            invv_s[b] = pd.Series(invv, index=idx)
+            rocS_s[b] = pd.Series(rocS, index=idx)
 
     cstart = max(s.index.min() for s in close_s.values())
     cend = min(s.index.max() for s in close_s.values())
@@ -250,6 +290,21 @@ def momentum_topk(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
     closes = np.column_stack([close_s[b].reindex(cal, method="ffill").to_numpy() for b in bases])
     active = np.column_stack([active_s[b].reindex(cal, method="ffill").fillna(0).to_numpy() for b in bases])
     mom = np.column_stack([mom_s[b].reindex(cal, method="ffill").to_numpy() for b in bases])
+
+    # Composite component matrices (T x J), aligned to the same calendar.
+    comp_rows = None
+    comp_w = None
+    if rank_mode == "composite":
+        w = comp_weights or {"breakout": 0.30, "roc_long": 0.30, "roc_short": 0.15,
+                             "rel_btc": 0.15, "inv_vol": 0.10}
+        brk = np.column_stack([brk_s[b].reindex(cal, method="ffill").to_numpy() for b in bases])
+        invv = np.column_stack([invv_s[b].reindex(cal, method="ffill").to_numpy() for b in bases])
+        rocS = np.column_stack([rocS_s[b].reindex(cal, method="ffill").to_numpy() for b in bases])
+        btc_col = bases.index(btc_base) if btc_base in bases else None
+        rel = mom - (mom[:, [btc_col]] if btc_col is not None else 0.0)
+        comp_rows = {"breakout": brk, "roc_long": mom, "roc_short": rocS,
+                     "rel_btc": rel, "inv_vol": invv}
+        comp_w = w
 
     T, J = closes.shape
     cash = capital; units = np.zeros(J); held: set[int] = set()
@@ -281,6 +336,11 @@ def momentum_topk(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
                 cand.sort(key=lambda j: mom[i, j], reverse=True)
             elif rank_mode == "weak":    # weakest first (falsification control)
                 cand.sort(key=lambda j: mom[i, j])
+            elif rank_mode == "composite" and comp_rows is not None:
+                zs = _zscore_at(list(comp_rows.values()), cand, i)
+                wts = list(comp_w.values())
+                score = {j: sum(wt * z for wt, z in zip(wts, zs[j])) for j in cand}
+                cand.sort(key=lambda j: score[j], reverse=True)
             else:                        # "none": fixed index order = no momentum info
                 cand.sort()
             rank = {j: r for r, j in enumerate(cand)}
@@ -352,6 +412,20 @@ def main() -> None:
     regime_ma = cfg["strategy"].get("btc_regime", {}).get("ma_period", 100) \
         if cfg["strategy"].get("btc_regime", {}).get("enabled", False) else 0
 
+    # B (scale-out) defaults come from the live `strategy.profit_taking` block so
+    # the research mirrors what main_loop.py would actually do once enabled.
+    pt = cfg["strategy"].get("profit_taking", {}) or {}
+    tiers = pt.get("tiers") or [{"profit_atr": 1.5, "scale_pct": 0.33},
+                                {"profit_atr": 3.0, "scale_pct": 0.33}]
+    scale_atr = [float(t["profit_atr"]) for t in tiers]
+    scale_pcts = [float(t["scale_pct"]) for t in tiers]
+    ratchet = [float(m) for m in (pt.get("ratchet_trail_mults") or [atr_mult, 2.5, 2.0])]
+    # D (composite ranking) weights/horizon come from the allocator config.
+    mr = cfg["strategy"].get("allocation", {}).get("momentum_rotation", {}) or {}
+    comp = mr.get("composite", {}) or {}
+    comp_weights = comp.get("weights")
+    roc_short = int(comp.get("roc_short_days", 20))
+
     bases = [b.strip().upper() for b in args.symbols.split(",")]
     if "BTC" not in bases:
         bases = ["BTC"] + bases
@@ -389,6 +463,10 @@ def main() -> None:
         base_runs = {b: baseline_asset(frames[b], entry, atr_mult, regime_on,
                                        capital / len(bases), fee, slip) for b in bases}
         A, A_bh, _ = equalweight_portfolio(base_runs, frames, "A baseline (live logic)")
+        # B: staged scale-out + ratcheting chandelier (the enhanced exit logic).
+        scale_runs = {b: scaleout_asset(frames[b], entry, regime_on, capital / len(bases),
+                                        fee, slip, scale_pcts, scale_atr, ratchet) for b in bases}
+        B, _, _ = equalweight_portfolio(scale_runs, frames, "B scale-out+ratchet")
         C1, C1_bh, cts = momentum_topk(frames, entry, atr_mult, regime_on, capital, fee, slip,
                                        args.topk, args.mom_lookback, "C1 momentum (daily)",
                                        rebalance_every=1, keep_band=0)
@@ -396,18 +474,26 @@ def main() -> None:
                                  args.topk, args.mom_lookback,
                                  f"C2 momentum ({args.rebalance_every}d+band)",
                                  rebalance_every=args.rebalance_every, keep_band=args.keep_band)
-        return A, A_bh, C1, C2, cts
+        # D: composite ranker (breakout+ROC+rel-strength+inv-vol) vs plain momentum.
+        C3, _, _ = momentum_topk(frames, entry, atr_mult, regime_on, capital, fee, slip,
+                                 args.topk, args.mom_lookback,
+                                 f"C3 composite ({args.rebalance_every}d+band)",
+                                 rebalance_every=args.rebalance_every, keep_band=args.keep_band,
+                                 rank_mode="composite", roc_short=roc_short, comp_weights=comp_weights)
+        return A, A_bh, B, C1, C2, C3, cts
 
     def cost_section(title: str, fee: float, slip: float) -> list[str]:
-        A, A_bh, C1, C2, cts = build(fee, slip)
+        A, A_bh, B, C1, C2, C3, cts = build(fee, slip)
         out = ["", "#" * 100, f"  {title}  (fee {fee:.2%}/side, slip {slip:.2%})", "#" * 100]
         for wname, mask_of in (("OUT-OF-SAMPLE (judge here)", lambda ts: ts > split),
                                ("FULL PERIOD", lambda ts: np.ones(len(ts), bool))):
             out += ["", "=" * 100, f"  {wname}", "=" * 100, f"  {'Config':<26}{hdr}"]
             out.append(_row(A.name, metrics(A, mask_of(_eq_ts), A_bh.equity)))
             out.append(_row("   Buy & Hold (eq-wt)", metrics(A_bh, mask_of(_eq_ts), A_bh.equity)))
+            out.append(_row(B.name, metrics(B, mask_of(_eq_ts), A_bh.equity)))
             out.append(_row(C1.name, metrics(C1, mask_of(cts), A_bh.equity)))
             out.append(_row(C2.name, metrics(C2, mask_of(cts), A_bh.equity)))
+            out.append(_row(C3.name, metrics(C3, mask_of(cts), A_bh.equity)))
             out.append("=" * 100)
         return out
 

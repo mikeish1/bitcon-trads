@@ -23,7 +23,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from loguru import logger
@@ -34,6 +34,7 @@ from src.data_pipeline import DataPipeline, build_exchange
 from src.executor import SpotExecutor
 from src.momentum_allocator import MomentumRotation
 from src.notifications import Notifier
+from src.regime import RegimeState, regime_from_config
 from src.risk_manager import RiskManager
 from src.strategy import Strategy, DonchianStrategy
 
@@ -71,9 +72,18 @@ class TradingBot:
         self.use_exchange_stop = self.cfg["exits"]["use_exchange_stop"]
         self.overrides = self.cfg["universe"].get("overrides", {}) or {}
         sd = self.cfg["strategy"]
-        self.regime_enabled = sd.get("btc_regime", {}).get("enabled", False)
-        self.regime_ma = sd.get("btc_regime", {}).get("ma_period", 100)
-        self._btc_risk_on = True
+        # Regime gating: the new `strategy.regime` block supersedes the legacy
+        # `strategy.btc_regime` when enabled; either being on activates gating.
+        rg = sd.get("regime", {}) or {}
+        self.regime_new = bool(rg.get("enabled", False))
+        self.regime_enabled = self.regime_new or sd.get("btc_regime", {}).get("enabled", False)
+        self.regime_ref = str(rg.get("reference", "BTC")).upper() if self.regime_new else "BTC"
+        # In risk-off: flatten open positions (legacy behaviour, default), and/or use
+        # a tighter chandelier on whatever is still held.
+        self.regime_risk_off_exit = bool(rg.get("risk_off_exit", True)) if self.regime_new else True
+        self.regime_tighten_trail = rg.get("tighten_trail_mult", None) if self.regime_new else None
+        self._regime = RegimeState(True, 1.0, 1.0, "init", "startup (assume risk-on)")
+        self._pvol: float | None = None    # expected portfolio daily-vol proxy (for vol targeting)
 
         # Allocation mode: first_come (default) or momentum_rotation.
         self.alloc_mode = sd.get("allocation", {}).get("mode", "first_come")
@@ -206,6 +216,12 @@ class TradingBot:
         open_value = self.risk.open_value(prices)
         n_open = len(self.risk.open_positions())
 
+        # Record the daily equity mark, then resolve the portfolio-vol estimate the
+        # optional global vol-target scalar uses: realized equity-curve vol when
+        # configured (and warmed up), else the instant ATR proxy.
+        self.risk.record_equity(equity)
+        self._pvol = self.risk.effective_portfolio_vol(self._portfolio_vol(snap))
+
         # Daily summary once per UTC day (use the primary symbol's candle clock).
         any_ts = next((s["ts"] for s in snap.values()), None)
         if any_ts is not None:
@@ -233,25 +249,39 @@ class TradingBot:
     # ------------------------------------------------------------------ #
     def _update_regime(self, snap: dict[str, dict]) -> None:
         if not self.regime_enabled:
-            self._btc_risk_on = True
+            self._regime = RegimeState(True, 1.0, 1.0, "disabled", "regime gating off")
             return
-        btc_sym = f"BTC/{self._quote}"
+        ref_sym = f"{self.regime_ref}/{self._quote}"
+        bf = None
         try:
-            bf = (snap[btc_sym]["frames"][self.primary_tf] if btc_sym in snap
-                  else self.data.get_frames(btc_sym)[self.primary_tf])
-            ma = bf["close"].rolling(self.regime_ma).mean().iloc[-1]
-            on = True if ma != ma else bool(bf.iloc[-1]["close"] > ma)
+            bf = (snap[ref_sym]["frames"][self.primary_tf] if ref_sym in snap
+                  else self.data.get_frames(ref_sym)[self.primary_tf])
         except Exception as exc:
-            logger.warning("BTC regime check failed ({}); assuming risk-on.", exc)
-            on = True
-        if on != self._btc_risk_on:
-            state = "RISK-ON (BTC uptrend)" if on else "RISK-OFF (BTC below MA)"
+            logger.warning("{} regime check failed ({}); assuming risk-on.", ref_sym, exc)
+        new = regime_from_config(bf, self.cfg)   # fail-open to risk-on inside
+        if new.risk_on != self._regime.risk_on:
+            state = (f"RISK-ON ({self.regime_ref} {new.reason})" if new.risk_on
+                     else f"RISK-OFF ({self.regime_ref} {new.reason}); size x{new.size_factor:g}")
             logger.warning("Market regime -> {}", state)
             self.notifier.error(f"Market regime: {state}")
-        self._btc_risk_on = on
+        self._regime = new
+
+    def _portfolio_vol(self, snap: dict[str, dict]) -> float | None:
+        """Expected daily portfolio-vol proxy = mean ATR% across held coins (or the
+        whole snapshot when flat). For a ~0.8-correlated crypto book this is a
+        reasonable stand-in for realized portfolio vol and needs no equity history.
+        Feeds the optional global vol-target scalar in RiskManager."""
+        held = {_base_of(p["symbol"]) for p in self.risk.open_positions()}
+        pcts = []
+        for sym, s in snap.items():
+            if s["price"] and s["atr"] and s["atr"] > 0:
+                if not held or _base_of(sym) in held:
+                    pcts.append(s["atr"] / s["price"])
+        return (sum(pcts) / len(pcts)) if pcts else None
 
     def _try_enter(self, sym, s, equity, avail_quote, open_value, n_open) -> float:
-        if self.regime_enabled and not self._btc_risk_on:
+        regime_factor = self._regime.size_factor if self.regime_enabled else 1.0
+        if regime_factor <= 0:
             return 0.0  # market risk-off: no new entries
         ep = self.overrides.get(_base_of(sym), {}).get("entry_period")
         if self.strategy_mode == "donchian":
@@ -272,10 +302,17 @@ class TradingBot:
             return 0.0
 
         atr_pct = (s["atr"] / s["price"]) if s["price"] else None
-        sizing = self.risk.size_for_asset(equity, avail_quote, open_value, atr_pct=atr_pct)
+        sizing = self.risk.size_for_asset(equity, avail_quote, open_value, atr_pct=atr_pct,
+                                          portfolio_vol=self._pvol, regime_factor=regime_factor)
         if not sizing["viable"]:
             logger.info("{} BUY skipped: size ${:.2f} below min / exposure cap.", sym, sizing["spend_usd"])
             return 0.0
+        if self.risk.risk_budget_enabled or regime_factor < 1.0:
+            logger.info("{} sizing: spend ${:.2f} | per-asset ${:.2f} | risk-notional {} | "
+                        "vol-scalar {:.2f} | regime x{:.2f}", sym, sizing["spend_usd"],
+                        sizing["per_asset_cap"],
+                        f"${sizing['risk_notional']:.2f}" if sizing["risk_notional"] else "n/a",
+                        sizing["vol_scalar"], sizing["regime_factor"])
 
         price = s["price"]
         fill = self.executor.market_buy(sym, sizing["spend_usd"], price)
@@ -287,7 +324,7 @@ class TradingBot:
             stop_order_id = self.executor.place_stop_limit_sell(
                 sym, fill["qty"], stop0, self.risk.stop_limit_price(stop0))
         self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, decision.reasoning,
-                              peak_price=fill["price"])
+                              peak_price=fill["price"], entry_atr=s["atr"])
         self._cb_notified = False
         self.notifier.entry(fill["price"], fill["qty"], fill["cost"], stop0, 0.0,
                             f"{sym}: {decision.reasoning}")
@@ -308,18 +345,20 @@ class TradingBot:
             return
 
         # Market risk-off: take no new exposure (open positions are flattened in _manage).
-        if self.regime_enabled and not self._btc_risk_on:
+        regime_factor = self._regime.size_factor if self.regime_enabled else 1.0
+        if regime_factor <= 0:
             self.risk.state_set("last_rotation_day", today)
             return
 
-        # Candidates = coins in an active Donchian trend with momentum defined.
-        cands: dict[str, float] = {}
+        # Candidates = coins in an active Donchian trend, scored for top-K ranking
+        # (simple ROC or composite blend per config). active_state filters first.
+        active_frames: dict[str, dict] = {}
         for sym, s in snap.items():
             ep = self.overrides.get(_base_of(sym), {}).get("entry_period")
             if self.strategy.active_state(s["frames"], entry_period=ep):
-                mom = self.rotation.momentum(s["frames"])
-                if mom is not None:
-                    cands[sym] = mom
+                active_frames[sym] = s["frames"]
+        btc_frames = snap.get(f"BTC/{self._quote}", {}).get("frames")
+        cands = self.rotation.score_candidates(active_frames, btc_frames)
         held = [p["symbol"] for p in self.risk.open_positions()]
         plan = self.rotation.plan(cands, held)
         if plan["exit"] or plan["enter"]:
@@ -362,7 +401,9 @@ class TradingBot:
             return 0.0
         if s["atr"] <= 0:
             return 0.0
-        sizing = self.risk.size_rotation(equity, avail_quote, open_value, self.rotation.top_k)
+        regime_factor = self._regime.size_factor if self.regime_enabled else 1.0
+        sizing = self.risk.size_rotation(equity, avail_quote, open_value, self.rotation.top_k,
+                                         portfolio_vol=self._pvol, regime_factor=regime_factor)
         if not sizing["viable"]:
             logger.info("{} rotation entry skipped: size ${:.2f} below min / exposure cap.",
                         sym, sizing["spend_usd"])
@@ -377,7 +418,8 @@ class TradingBot:
             stop_order_id = self.executor.place_stop_limit_sell(
                 sym, fill["qty"], stop0, self.risk.stop_limit_price(stop0))
         reason = f"momentum rotation: top-{self.rotation.top_k} entry"
-        self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, reason, peak_price=fill["price"])
+        self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, reason,
+                              peak_price=fill["price"], entry_atr=s["atr"])
         self.risk.log_decision(sym, "BUY", 1, False, reason)
         self._cb_notified = False
         self.notifier.entry(fill["price"], fill["qty"], fill["cost"], stop0, 0.0, f"{sym}: {reason}")
@@ -396,26 +438,88 @@ class TradingBot:
                 self.notifier.exit(pos["current_stop"] or price, 0.0, f"{sym}: exchange stop filled")
                 return
 
-        # Market risk-off: BTC below its regime MA -> exit everything.
-        if self.regime_enabled and not self._btc_risk_on:
-            self._exit(sym, pos, price, "BTC risk-off")
+        # Market risk-off -> flatten (legacy default) unless configured to hold+tighten.
+        if (self.regime_enabled and not self._regime.risk_on and self.regime_risk_off_exit):
+            self._exit(sym, pos, price, f"{self.regime_ref} risk-off")
             return
+
+        # --- Staged profit-taking: scale out tranches + ratchet/breakeven (opt-in) -
+        trail_mult: float | None = None
+        breakeven_floor: float | None = None
+        scaled = False
+        if self.risk.profit_taking_enabled and atr > 0:
+            plan = self.risk.profit_taking_plan(pos, price, atr)
+            trail_mult, breakeven_floor = plan["trail_mult"], plan["breakeven_floor"]
+            if plan["scale_fraction"] > 0:
+                scaled = self._scale_out(sym, pos, price, plan)
+                pos = self.risk.open_position(sym)
+                if pos is None:
+                    return  # position fully exited (final tranche) - nothing left to manage
+
+        # Time-based exit for very long winners that have already scaled (optional).
+        if (self.risk.pt_time_stop_days > 0 and (pos["tranches_done"] or 0) > 0
+                and self._days_held(pos) >= self.risk.pt_time_stop_days):
+            self._exit(sym, pos, price, f"time stop ({self.risk.pt_time_stop_days}d runner)")
+            return
+
+        # Risk-off but configured to hold and tighten rather than flatten.
+        if (self.regime_enabled and not self._regime.risk_on
+                and self.regime_tighten_trail is not None):
+            tm = float(self.regime_tighten_trail)
+            trail_mult = tm if trail_mult is None else min(trail_mult, tm)
 
         prev_stop = pos["current_stop"] or pos["stop_price"]
         peak = max(pos["peak_price"] or pos["entry_price"], price)
-        new_stop = self.risk.chandelier_stop(peak, atr) if atr > 0 else prev_stop
+        new_stop = self.risk.chandelier_stop(peak, atr, mult=trail_mult) if atr > 0 else prev_stop
         current_stop = max(prev_stop, new_stop)
+        if breakeven_floor is not None:                 # lock in BE+buffer once armed
+            current_stop = max(current_stop, breakeven_floor)
         sid = pos["stop_order_id"]
+        # Re-place the resting stop if it ratcheted up OR a scale-out changed the qty.
         if (self.cfg["runtime"]["place_orders"] and self.use_exchange_stop
-                and current_stop > prev_stop * 1.001):
+                and (scaled or current_stop > prev_stop * 1.001)):
             self.executor.cancel(sym, pos["stop_order_id"])
             sid = self.executor.place_stop_limit_sell(
                 sym, pos["qty"], current_stop, self.risk.stop_limit_price(current_stop))
-            logger.info("{} chandelier raised {:.4f} -> {:.4f}", sym, prev_stop, current_stop)
+            if current_stop > prev_stop * 1.001:
+                logger.info("{} chandelier raised {:.4f} -> {:.4f}", sym, prev_stop, current_stop)
         self.risk.update_trail(pos["id"], peak, current_stop, sid)
 
         if price <= current_stop:
             self._exit(sym, pos, price, "chandelier trail")
+
+    def _scale_out(self, sym: str, pos, price: float, plan: dict) -> bool:
+        """Execute one staged profit-taking sell of a fraction of the ORIGINAL
+        position. Cancels the resting exchange stop first (re-placed for the reduced
+        qty by the caller). If the remainder would be unsellable dust, exits fully
+        instead. Returns True iff a partial sell was booked."""
+        orig = pos["orig_qty"] or pos["qty"]
+        sell_qty = min(plan["scale_fraction"] * orig, pos["qty"])
+        remaining = pos["qty"] - sell_qty
+        if sell_qty <= 0:
+            return False
+        if remaining * price < self.cfg["risk"]["min_notional_usd"]:
+            self._exit(sym, pos, price, "profit-taking (final tranche)")
+            return False
+        if self.cfg["runtime"]["place_orders"] and self.use_exchange_stop:
+            self.executor.cancel(sym, pos["stop_order_id"])
+        fill = self.executor.market_sell(sym, sell_qty, price, plan["reason"])
+        if fill is None:
+            logger.error("{} scale-out sell failed - will retry next cycle.", sym)
+            return False
+        realized = self.risk.reduce_position(pos, fill, plan["new_tranches"], plan["reason"])
+        self.notifier.exit(fill["price"], realized, f"{sym}: {plan['reason']}")
+        return True
+
+    @staticmethod
+    def _days_held(pos) -> float:
+        try:
+            opened = datetime.fromisoformat(pos["opened_at"])
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - opened).total_seconds() / 86400.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def _exit(self, sym: str, pos, price: float, reason: str) -> None:
         if self.cfg["runtime"]["place_orders"] and self.use_exchange_stop:

@@ -98,6 +98,26 @@ def load_config() -> dict[str, Any]:
     if alloc_env:
         cfg["strategy"]["allocation"]["mode"] = alloc_env.strip().lower()
 
+    # --- Enhancement toggles: present-by-default sections + "flip-it-fast" env vars.
+    # Every new feature is OFF by default, so these setdefaults keep behaviour
+    # identical for existing configs while letting env vars flip features without
+    # editing YAML (mirrors ALLOCATION_MODE above).
+    cfg["strategy"].setdefault("regime", {"enabled": False})
+    cfg["strategy"].setdefault("profit_taking", {"enabled": False})
+    cfg["risk"].setdefault("risk_budget", {"enabled": False})
+    if os.getenv("REGIME_ENABLED") is not None:
+        cfg["strategy"]["regime"]["enabled"] = _env_bool("REGIME_ENABLED", False)
+    if os.getenv("REGIME_METHOD"):
+        cfg["strategy"]["regime"]["method"] = os.getenv("REGIME_METHOD").strip().lower()
+    if os.getenv("PROFIT_TAKING_ENABLED") is not None:
+        cfg["strategy"]["profit_taking"]["enabled"] = _env_bool("PROFIT_TAKING_ENABLED", False)
+    if os.getenv("RISK_BUDGET_ENABLED") is not None:
+        cfg["risk"]["risk_budget"]["enabled"] = _env_bool("RISK_BUDGET_ENABLED", False)
+    mom_scoring = os.getenv("MOMENTUM_SCORING")
+    if mom_scoring:
+        cfg["strategy"]["allocation"].setdefault("momentum_rotation", {})
+        cfg["strategy"]["allocation"]["momentum_rotation"]["scoring"] = mom_scoring.strip().lower()
+
     cfg["runtime"] = {
         "paper_trading": paper,
         "live_trading_enabled": live_enabled,

@@ -60,7 +60,8 @@ def asset_exposure(df: pd.DataFrame, entry: int, atr_mult: float,
 
 def run_config(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
                capital: float, fee: float, slip: float, split: np.datetime64,
-               regime_ma: int = 0, vol_target: bool = False) -> dict:
+               regime_ma: int = 0, vol_target: bool = False,
+               risk_parity: bool = False) -> dict:
     bases = list(frames.keys())
     n = len(bases)
 
@@ -70,8 +71,21 @@ def run_config(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
         ro = (btc["close"] > btc["close"].rolling(regime_ma).mean())
         regime_on = pd.Series(ro.to_numpy(), index=_idx(btc)).astype(float)
 
-    # Inverse-vol weights (from full-history daily-return stdev), else equal.
-    if vol_target:
+    # Sizing weights:
+    #   risk_parity -> inverse mean ATR% (the ATR-stop risk budget used live: lower-
+    #                  vol coins get more capital so each carries similar stop risk),
+    #   vol_target  -> inverse daily-return stdev,
+    #   else        -> equal weight.
+    if risk_parity:
+        inv = {}
+        for b in bases:
+            atr = ta.volatility.average_true_range(
+                frames[b]["high"], frames[b]["low"], frames[b]["close"], 14)
+            m = (atr / frames[b]["close"]).dropna().mean()
+            inv[b] = 1.0 / (m if m and m > 0 else 1.0)
+        tot = sum(inv.values())
+        weights = {b: inv[b] / tot for b in bases}
+    elif vol_target:
         inv = {}
         for b in bases:
             r = frames[b]["close"].pct_change().dropna()
@@ -144,6 +158,7 @@ def main() -> None:
         ("A baseline (equal-weight)", dict(regime_ma=0, vol_target=False)),
         ("B + BTC regime filter", dict(regime_ma=args.regime_ma, vol_target=False)),
         ("C + regime + vol-target", dict(regime_ma=args.regime_ma, vol_target=True)),
+        ("D + regime + risk-parity(ATR)", dict(regime_ma=args.regime_ma, risk_parity=True)),
     ]
     cols = ["total_return_pct", "cagr_pct", "max_dd_pct", "mar", "sharpe", "pct_in_market", "switches"]
     hdr = "".join(f"{h:>9}" for h in ["Ret%", "CAGR%", "MaxDD%", "MAR", "Sharpe", "InMkt%", "Sw"])

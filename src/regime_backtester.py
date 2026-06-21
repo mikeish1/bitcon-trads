@@ -46,6 +46,7 @@ import ta  # noqa: E402
 from loguru import logger  # noqa: E402
 
 from src.config import load_config  # noqa: E402
+from src.regime import get_regime_state  # noqa: E402
 
 BACKTEST_DIR = os.path.join(_PROJECT_ROOT, "backtests")
 DEFAULT_CSV = os.path.join(BACKTEST_DIR, "BTC_1d.csv")
@@ -204,6 +205,40 @@ def regime(close: np.ndarray, high: np.ndarray, ma: np.ndarray, atr: np.ndarray,
     return Run(name, eq, exp, sw, fees)
 
 
+def regime_module(df: pd.DataFrame, capital: float, fee: float, slip: float,
+                  method: str, params: dict, name: str) -> Run:
+    """Drive a long/flat BTC equity curve from the LIVE `src.regime` gate, evaluated
+    bar-by-bar on a trailing window (no lookahead). This exercises the exact
+    `get_regime_state` used by main_loop, so the research metrics reflect the
+    shipped module rather than a re-implementation. Risk-on -> hold BTC; risk-off
+    (size_factor 0) -> cash."""
+    close = df["close"].to_numpy()
+    n = len(close)
+    # Trailing window big enough for the longest indicator the gate needs.
+    win = int(params.get("ma_period", 100)) + int(params.get("slope_lookback", 20)) \
+        + int(params.get("vol_period", 20)) + 5
+    risk_on = np.zeros(n)
+    for i in range(n):
+        sub = df.iloc[max(0, i - win):i + 1]
+        risk_on[i] = 1.0 if get_regime_state(sub, method=method, params=params).risk_on else 0.0
+
+    eq = np.empty(n); cash = capital; btc = 0.0; invested = False
+    sw = np.zeros(n); fees = np.zeros(n); exp = np.zeros(n)
+    for i in range(n):
+        want = risk_on[i] > 0
+        if want and not invested and cash > 0:
+            f = cash * fee
+            btc = (cash - f) / (close[i] * (1 + slip)); cash = 0.0; invested = True
+            fees[i] += f; sw[i] = 1
+        elif not want and invested:
+            f = btc * close[i] * (1 - slip) * fee
+            cash = btc * close[i] * (1 - slip) - f; btc = 0.0; invested = False
+            fees[i] += f; sw[i] = 1
+        eq[i] = cash + btc * close[i]
+        exp[i] = 1.0 if invested else 0.0
+    return Run(name, eq, exp, sw, fees)
+
+
 # --------------------------------------------------------------------------- #
 # Metrics                                                                      #
 # --------------------------------------------------------------------------- #
@@ -316,7 +351,15 @@ def main() -> None:
                           buf, True, 3.0, "Regime + slope + chand")
     dca_run = dca(close, ts, capital, fee, slip, weeks=12)
 
-    runs = [bh, dca_run, ma_filter, regime_chand, regime_slope]
+    # Matured regime gate from the LIVE src/regime.py module (ma_slope + composite).
+    mod_params = {"ma_period": ma_p, "slope_lookback": 20, "vol_period": 20,
+                  "vol_ceiling": 0.05, "score_threshold": 0.5}
+    mod_slope = regime_module(df, capital, fee, slip, "ma_slope", mod_params,
+                              "Regime module (ma_slope)")
+    mod_comp = regime_module(df, capital, fee, slip, "composite", mod_params,
+                             "Regime module (composite)")
+
+    runs = [bh, dca_run, ma_filter, regime_chand, regime_slope, mod_slope, mod_comp]
 
     out = []
     out.append(print_block("IN-SAMPLE  (tuning window)", runs, is_mask, close))

@@ -79,11 +79,51 @@ strategy:
     enabled: true
     ma_period: 100
 
+  # --- Higher-timeframe regime gate (matured btc_regime; see src/regime.py) -----
+  # A fuller, configurable risk-on/off gate on a reference asset (default BTC).
+  # When `enabled: true` this SUPERSEDES the simple `btc_regime` block above; when
+  # false (default) the legacy btc_regime behaviour is used unchanged. Instead of a
+  # hard on/off it produces a `size_factor` so risk-off can either block new
+  # entries (factor 0.0, the legacy behaviour) or merely shrink them (e.g. 0.2).
+  #   method: "ma"        -> close > rolling MA (== legacy btc_regime).
+  #           "ma_slope"  -> close > MA AND the MA is rising over slope_lookback.
+  #           "vol"       -> realized daily vol must be below vol_ceiling.
+  #           "composite" -> weighted risk-on score (ma+slope+vol) vs score_threshold.
+  regime:
+    enabled: false
+    reference: "BTC"             # base asset whose trend defines the regime
+    method: "ma"                 # ma | ma_slope | vol | composite
+    ma_period: 100               # MA length for the trend test (matches btc_regime)
+    slope_lookback: 20           # bars used for the rising-MA test (ma_slope/composite)
+    vol_period: 20               # window for realized daily vol (vol/composite)
+    vol_ceiling: 0.05            # daily vol above this = risk-off (vol/composite)
+    score_threshold: 0.5         # composite risk-on score must exceed this
+    weights: {ma: 0.5, slope: 0.25, vol: 0.25}   # composite component weights
+    risk_off_size_factor: 0.0    # fraction of normal size allowed in risk-off (0 = none)
+    risk_off_exit: true          # also flatten open positions in risk-off (legacy behaviour)
+    tighten_trail_mult: null     # optional tighter chandelier mult while risk-off (null = unchanged)
+
   # --- Volatility-targeted sizing (optional; ~neutral in tests, default off) ---
   # When on, coins more volatile than target_daily_vol get a smaller allocation.
   vol_target:
     enabled: false
     target_daily_vol: 0.04
+
+  # --- Staged profit-taking / ratcheting exits (default off; see src/strategy.py) -
+  # Builds ON TOP of the ATR chandelier trail. As a winner extends (measured in
+  # multiples of the ATR captured AT ENTRY), scale out tranches, ratchet the stop
+  # to breakeven+buffer, and tighten the trailing multiple on the residual runner.
+  # All exits remain long-only and ratchet favourably only (the stop never loosens).
+  # Disabled by default so live behaviour is identical until you opt in.
+  profit_taking:
+    enabled: false
+    tiers:                       # each tier fires at most once, in ascending order
+      - {profit_atr: 1.5, scale_pct: 0.33}   # at +1.5*ATR sell 33% of the ORIGINAL size
+      - {profit_atr: 3.0, scale_pct: 0.33}   # at +3.0*ATR sell another 33%
+    breakeven_after_tier: 1      # after this many tiers fire, lift stop to BE+buffer
+    breakeven_buffer_atr: 0.5    # breakeven floor = entry + 0.5*ATR_at_entry
+    ratchet_trail_mults: [3.0, 2.5, 2.0]   # chandelier mult by #tiers filled (tightens)
+    time_stop_days: 0            # >0: exit the runner after N days with no new peak (0 = off)
 
   # --- Allocation mode: HOW capital is deployed across the universe -----------
   # first_come        = current live behavior. Every coin that breaks out is sized
@@ -101,6 +141,20 @@ strategy:
       rebalance_days: 2       # rotate at most every N days (RISK exits still any day)
       lookback_days: 90       # momentum = close / close N days ago - 1
       keep_band: 1            # hysteresis: keep a held coin until rank > top_k+keep_band
+      # --- Ranking signal: "simple" = the validated N-day ROC (default). ---------
+      # "composite" ranks by a normalized weighted blend of breakout strength,
+      # short + long ROC, relative strength vs BTC, and an inverse-vol/liquidity
+      # term - concentrating capital on the highest-quality breakouts. Components
+      # are normalized cross-sectionally (z-score) across the candidate set each
+      # rebalance, so weights are comparable. Default "simple" preserves the OOS-
+      # validated behaviour; flip to "composite" only after paper-testing.
+      scoring: "simple"       # "simple" | "composite"
+      min_momentum_threshold: null   # exclude assets whose long ROC is below this (null = off)
+      composite:
+        weights: {breakout: 0.30, roc_long: 0.30, roc_short: 0.15, rel_btc: 0.15, inv_vol: 0.10}
+        roc_short_days: 20    # shorter ROC horizon for the composite
+        entry_period: 40      # Donchian window for breakout-strength (defaults to donchian.entry_period)
+        normalize: "zscore"   # "zscore" | "rank" (cross-sectional normalization)
 
 # --- High-conviction long logic (ONLY used when strategy.mode=high_conviction) -
   # LAYER 1 - Hard gates. ALL must pass or the bot stays flat.
@@ -138,6 +192,32 @@ risk:
   min_notional_usd: 10.0      # Binance.US minimum order value (skip anything smaller)
   kelly_fraction: 0.25        # conservative fractional-Kelly scaler on the risk %
   kelly_assumed_payoff: 2.0   # reward:risk assumption for the Kelly calc
+
+  # --- Explicit per-trade risk budgeting + global vol targeting (default off) ---
+  # When `enabled`, a new trend position is sized so that being stopped out at the
+  # initial ATR stop loses about `risk_per_trade_pct` of equity:
+  #     stop_distance_pct = atr_pct * atr_stop_mult            (entry -> initial stop)
+  #     risk_notional     = equity * risk_per_trade_pct / stop_distance_pct
+  # The position is then min(per_asset_cap, risk_notional, ...hard caps). On top of
+  # that, an optional GLOBAL vol-target scalar nudges total exposure toward a target
+  # daily portfolio vol (clamped to [scalar_min, scalar_max]); it can shrink size in
+  # turbulent tape and grow it (only up to the existing hard caps) in calm trends.
+  # All hard caps (capital_policy envelope, per_asset_alloc, available cash) STILL
+  # bind, so enabling this never raises risk beyond what those caps already permit.
+  risk_budget:
+    enabled: false
+    risk_per_trade_pct: 0.0075   # per-trade equity-at-risk used for ATR-stop sizing
+    atr_stop_mult: 2.0           # entry->initial-stop distance in ATRs (matches exits.atr_stop_mult)
+    target_portfolio_vol: 0.025  # desired daily portfolio vol for the global scalar (0 = off)
+    vol_scalar_min: 0.5          # clamp on the global exposure scalar (floor)
+    vol_scalar_max: 2.0          # clamp on the global exposure scalar (ceiling)
+    # How the GLOBAL vol-target scalar measures current portfolio vol:
+    #   "proxy"    -> mean ATR% across held coins (no state; reacts instantly).
+    #   "realized" -> stdev of daily portfolio-equity returns over vol_lookback_days
+    #                 (true realized vol from the equity curve; falls back to the
+    #                 proxy until enough daily equity snapshots exist).
+    vol_source: "proxy"          # "proxy" | "realized"
+    vol_lookback_days: 20        # window for realized portfolio vol
 
 # --- Exits: ATR trailing stop + exchange-side protective stop ----------------
 exits:
