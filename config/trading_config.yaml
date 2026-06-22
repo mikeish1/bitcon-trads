@@ -12,6 +12,13 @@ market:
   confirm_timeframes: []      # donchian mode uses a single timeframe
   backfill_candles: 400       # daily candles on startup (~1.1y; warms indicators)
   poll_seconds: 900           # check every 15 min (a daily strategy needs no faster)
+  # Decide signals on the last CONFIRMED-CLOSED candle (recommended). The breakout,
+  # regime, momentum scoring and the sizing ATR then read a settled bar - exactly
+  # like the close-based backtest - while marking/sizing/orders use the LIVE price.
+  # Prevents a mid-candle process start/redeploy from trading an unconfirmed intraday
+  # level vs the prior high (a silent backtest/live divergence). Reversible: false
+  # restores the old "act on the in-progress candle" behaviour. Env: SIGNAL_ON_CLOSED_CANDLE.
+  signal_on_closed_candle: true
 
 # --- The trading universe (dynamic; add/remove coins here, no code changes) --
 # List the BASE assets you want to trade. The quote currency is chosen per venue
