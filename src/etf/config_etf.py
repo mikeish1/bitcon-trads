@@ -53,6 +53,10 @@ def load_etf_config() -> dict[str, Any]:
     cap.setdefault("min_notional_usd", 10.0)
 
     e.setdefault("alpaca_feed", "iex")             # free Alpaca data uses the IEX feed
+    # Split- AND dividend-adjust bars by default. RAW (unadjusted) bars would inject
+    # phantom split/ex-div gaps that fire false trend exits - see data_bias_audit.md.
+    e["alpaca_adjustment"] = os.getenv(
+        "ETF_ALPACA_ADJUSTMENT", str(e.get("alpaca_adjustment", "all"))).strip().lower()
 
     ex = e.setdefault("execution", {})
     mode = os.getenv("ETF_EXECUTION_MODE", ex.get("mode", "sim")).strip().lower()

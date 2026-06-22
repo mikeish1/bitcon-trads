@@ -1,0 +1,56 @@
+{
+  "handoff": {
+    "step_id": "stage-1-strategy-design",
+    "status": "success",
+    "confidence": 0.82,
+    "key_outputs": {
+      "candidates": {
+        "A": "Harden incumbent: Donchian-gated top-K rotation + absolute-momentum cash filter + chandelier stop (control)",
+        "B": "Dual momentum (GEM) + enriched strongest-of-{bonds,gold,T-bills} defensive sleeve (RECOMMENDED primary)",
+        "C": "CTA multi-asset trend ensemble, inverse-vol weighted (drawdown-maximalist alternative)",
+        "D": "Regime-gated barbell offense/defense (rejected primary; its ideas folded into B)"
+      },
+      "recommendation": "B primary; C alternative if drawdown>tax; A is the mandatory control any new design must beat after-tax OOS",
+      "selection_criteria_locked": "taxable -> turnover/wash-sale/tax penalized; small acct -> ticket friction; drawdown-first; few-parameter favored vs weak-OOS-momentum prior",
+      "stage4_benchmarks": ["Candidate A (control)", "SPY buy-and-hold", "60/40"],
+      "defensive_sleeve_note": "GEM single-bond default enriched to strongest-of {TLT/IEF, GLD, BIL} so the 2022 bonds+stocks-down case has gold/T-bills to hide in"
+    },
+    "assumptions": [
+      "human will select among A/B/C at this checkpoint",
+      "12-month-ish absolute-momentum lookback for B; weekly clock with hysteresis acting ~monthly",
+      "MV/BL/HRP and ML rejected at this N/scale; EW + inverse-vol are the construction choices"
+    ],
+    "open_issues": [
+      "human selection pending",
+      "exact offensive/defensive universe membership to finalize in Stage 2/3",
+      "B concentration (hold 1 vs top-2) to settle during implementation/validation"
+    ],
+    "artifacts": [
+      "docs/equities_replatform/strategy_options.md",
+      "docs/equities_replatform/decisions/stage-1.json"
+    ],
+    "verification_passed": true,
+    "next_focus": "Stage 2: fix the RAW->adjusted bars bug, universe/bias audit, data-quality checks, point-in-time note for the selected design."
+  },
+  "judge": {
+    "overall_score": 8.5,
+    "decision": "pass",
+    "dimensions": {
+      "correctness": {"score": 8, "reasoning": "Candidates map to real, implementable changes on the existing engine; the taxonomy is surveyed with explicit accept/reject reasons as required."},
+      "methodological_rigor": {"score": 8, "reasoning": "Failure modes (V-reversals, gap risk, 2022 bonds+stocks, whipsaw) named per candidate; the weak-OOS-momentum prior is carried as a selection penalty, not ignored."},
+      "robustness": {"score": 8, "reasoning": "Defers the verdict to Stage-4 walk-forward with G1-G7 + Monte-Carlo + sensitivity + regime windows + after-tax; recommendation favors the fewest-parameter design for OOS survival."},
+      "safety_compliance": {"score": 9, "reasoning": "Long-only, tripwire/cap-stack reuse, tax/wash-sale/PDT-aware framing, paper-only; AI not in the trade trigger."},
+      "simplicity": {"score": 9, "reasoning": "Explicitly recommends the lowest-parameter candidate and folds D's good ideas into B rather than stacking designs; rejects elaborate construction (MV/BL/HRP/ML)."},
+      "diversity": {"score": 9, "reasoning": "Four genuinely different designs spanning concentration, reactivity, construction (EW vs inverse-vol vs single), and defensive mechanism."},
+      "clarity": {"score": 9, "reasoning": "Comparison matrix, per-candidate structure, explicit recommendation + control + rejected, and a clear hand-off to the Stage-4 decision rule."}
+    },
+    "issues_found": [
+      "Recommendation is conditional on Stage-4 evidence; cannot be ratified as profitable yet (by design)",
+      "Universe membership and B's hold-count left to Stage 2/3"
+    ],
+    "suggested_revisions": [
+      "Human selects A, B, or C before Stage 2 begins"
+    ],
+    "confidence_in_judgment": 0.82
+  }
+}

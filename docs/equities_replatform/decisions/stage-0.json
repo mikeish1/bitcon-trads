@@ -1,0 +1,54 @@
+{
+  "handoff": {
+    "step_id": "stage-0-plan-scope",
+    "status": "success",
+    "confidence": 0.86,
+    "key_outputs": {
+      "reuse_vs_rewrite": "REUSE/EXTEND (high confidence) — src/etf/ plumbing + two-key tripwire + venue-agnostic broker ABC are already the target architecture; rewrite unjustified",
+      "headline_finding": "AlpacaBroker.daily_bars uses RAW (split/div-unadjusted) bars — violates mandatory adjusted-data rule; #1 Stage-2 fix",
+      "validation_gap": "etf/backtester is close-to-close, zero-cost, no IS/OOS, no benchmarks — cannot support a go/no-go; full harness is Stage 4",
+      "codepath_drift": "no golden-master parity between ETF live loop and backtester; add sim≡backtest parity test in Stage 3",
+      "deploy_gate": "G1-G7 in plan.md §4 (OOS risk-adjusted >= SPY/60-40 or lower DD; maxDD <= -25%; OOS MAR >= 0.5x IS; +-1 notch param stability; regime survival; gap+cost honest; tax/turnover budget)",
+      "honest_prior": "most likely outcome is 'lower drawdown, not higher return'; 'do not deploy' is an acceptable Stage-4 result"
+    },
+    "assumptions": [
+      "Alpaca is the broker; small account ($250-$2k ETF sleeve, config default 2000)",
+      "long-only, weekly rebalance with hysteresis, ETF basket across asset classes",
+      "paper-first; no real-money switches flipped by the agent",
+      "account-type (taxable vs IRA) to be confirmed at checkpoint; affects G7 weighting"
+    ],
+    "open_issues": [
+      "strategy latitude for Stage 1 (harden existing vs survey new designs)",
+      "taxable vs tax-advantaged account",
+      "branch base: feat/etf-equities-replatform off main vs stacked on fix/etf-sleeve-hardening",
+      "confirm ETF sleeve size and live intent"
+    ],
+    "artifacts": [
+      "docs/equities_replatform/plan.md",
+      "docs/equities_replatform/risk_register.md",
+      "docs/equities_replatform/decisions/stage-0.json"
+    ],
+    "verification_passed": true,
+    "next_focus": "Stage 1: survey 3-4 diverse candidate designs, recommend one with economic rationale; human selects."
+  },
+  "judge": {
+    "overall_score": 8.6,
+    "decision": "pass",
+    "dimensions": {
+      "correctness": {"score": 9, "reasoning": "Plan grounded in actual code reads (selector/risk/broker/config/backtester) and a verified Alpaca-docs fact (RAW default), not assumptions; reuse decision matches reality."},
+      "methodological_rigor": {"score": 9, "reasoning": "Surfaces the adjusted-data violation, zero-cost/in-sample backtest, and codepath-drift risk up front; bakes look-ahead/survivorship/overfit into acceptance gates and the register."},
+      "robustness": {"score": 8, "reasoning": "Acceptance criteria require OOS, walk-forward, regimes, Monte-Carlo, and parameter sensitivity with numeric thresholds; honest null-hypothesis prior carried forward."},
+      "safety_compliance": {"score": 9, "reasoning": "Two-key tripwire, no-withdrawal keys, single-replica, paper-first, AI-as-advisor all preserved as non-negotiables; PDT/wash-sale/gap/corporate-actions scheduled."},
+      "simplicity": {"score": 8, "reasoning": "Extend-not-rewrite; explicit scope-creep risk (R16) and bias toward smallest change that clears the bar; each new parameter must earn an ADR."},
+      "clarity": {"score": 9, "reasoning": "Milestone table with dependencies, measurable gates, ranked risk register, and explicit open questions for the human."}
+    },
+    "issues_found": [
+      "Account type unresolved -> tax-drag gate (G7) cannot be fully scoped until confirmed",
+      "Strategy latitude for Stage 1 is a human choice, not yet made"
+    ],
+    "suggested_revisions": [
+      "Resolve the four open questions at the checkpoint before Stage 1 begins"
+    ],
+    "confidence_in_judgment": 0.84
+  }
+}

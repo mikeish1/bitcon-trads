@@ -92,3 +92,45 @@ def test_alpaca_broker_requires_keys():
     from src.etf.brokers.alpaca_broker import AlpacaBroker
     with pytest.raises(SystemExit):
         AlpacaBroker(etf_cfg())                 # api_key/secret are empty
+
+
+def _alpaca_with_captured_request(cfg):
+    """Build an AlpacaBroker offline and stub its data client to capture the bars
+    request (so we can assert the adjustment) and return a small frame."""
+    broker = build_broker(cfg)
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        df = pd.DataFrame({
+            "timestamp": pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC"),
+            "open": [1.0, 2.0, 3.0], "high": [1.0, 2.0, 3.0], "low": [1.0, 2.0, 3.0],
+            "close": [1.0, 2.0, 3.0], "volume": [10.0, 10.0, 10.0],
+        })
+
+    def _fake_get_stock_bars(req):
+        captured["req"] = req
+        return _Resp()
+
+    broker._data.get_stock_bars = _fake_get_stock_bars   # no network
+    return broker, captured
+
+
+def test_daily_bars_requests_split_and_dividend_adjusted():
+    """Regression for the RAW-bars bug: bars MUST be requested split+div adjusted,
+    else splits print phantom gaps that fire false trend exits."""
+    from alpaca.data.enums import Adjustment
+    cfg = etf_cfg()
+    cfg["etf_runtime"].update({"api_key": "dummy", "api_secret": "dummy"})
+    broker, captured = _alpaca_with_captured_request(cfg)
+    broker.daily_bars("SPY", 100)
+    assert captured["req"].adjustment == Adjustment.ALL
+
+
+def test_daily_bars_adjustment_is_configurable():
+    from alpaca.data.enums import Adjustment
+    cfg = etf_cfg()
+    cfg["etf"]["alpaca_adjustment"] = "raw"               # explicit opt-out
+    cfg["etf_runtime"].update({"api_key": "dummy", "api_secret": "dummy"})
+    broker, captured = _alpaca_with_captured_request(cfg)
+    broker.daily_bars("SPY", 100)
+    assert captured["req"].adjustment == Adjustment.RAW

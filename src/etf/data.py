@@ -10,9 +10,11 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
+from loguru import logger
 
 from src.data_pipeline import DataPipeline
 from .brokers.base import EtfBroker
+from .data_quality import validate_bars
 
 
 class EtfData:
@@ -25,8 +27,15 @@ class EtfData:
 
     def frames(self, symbol: str) -> dict[str, pd.DataFrame]:
         """{primary_tf: dataframe-with-indicators} for one symbol (full history,
-        including any still-forming session bar - that bar carries the live price)."""
-        return {self.tf: DataPipeline.add_indicators(self.broker.daily_bars(symbol, self.backfill))}
+        including any still-forming session bar - that bar carries the live price).
+        Raw bars are quality-checked first (bad ticks / dupes dropped, gaps logged)
+        so the trend/momentum signal is never computed on corrupt data."""
+        report = validate_bars(self.broker.daily_bars(symbol, self.backfill), symbol=symbol)
+        if report.issues:
+            level = "warning" if report.ok else "error"
+            logger.log(level.upper(), "ETF data quality [{}]: {}", symbol,
+                       "; ".join(report.issues))
+        return {self.tf: DataPipeline.add_indicators(report.clean)}
 
     def closed_view(self, frames: dict[str, pd.DataFrame],
                     market_open: bool) -> dict[str, pd.DataFrame]:
