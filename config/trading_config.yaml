@@ -175,9 +175,14 @@ strategy:
   # multiples of the ATR captured AT ENTRY), scale out tranches, ratchet the stop
   # to breakeven+buffer, and tighten the trailing multiple on the residual runner.
   # All exits remain long-only and ratchet favourably only (the stop never loosens).
-  # Disabled by default so live behaviour is identical until you opt in.
+  # VALIDATED OOS (2026-06, src/profit_taking_research.py, TRUE live logic incl. the
+  # breakeven floor): vs the baseline's OOS -2.1%/-9.6% (nominal/stressed, MAR -0.02/
+  # -0.11, maxDD -42%), staged exits give OOS +20.4%/+12.3% (MAR 0.63/0.37, maxDD -15%)
+  # - positive under STRESSED costs and ~1/3 the drawdown. Engine parity vs the live
+  # path is locked by tests/test_sim_live_parity.py. PAPER-validate >=30d before the
+  # real-money tripwire; revert with enabled:false (fully reversible, paper-gated).
   profit_taking:
-    enabled: false
+    enabled: true
     tiers:                       # each tier fires at most once, in ascending order
       - {profit_atr: 1.5, scale_pct: 0.33}   # at +1.5*ATR sell 33% of the ORIGINAL size
       - {profit_atr: 3.0, scale_pct: 0.33}   # at +3.0*ATR sell another 33%
@@ -318,11 +323,16 @@ execution:
   limit_poll_interval_sec: 3      # how often to poll the resting limit (live)
   post_only: false                # exchange post-only (maker-only) where supported
   # Paper/sim fill realism (live fills are always real):
-  #   optimistic - the limit fills in full at the limit price (best case; default).
+  #   optimistic - the limit fills in full at the limit price (best case).
   #   realistic  - only `paper_limit_fill_ratio` fills at the limit; the remainder
   #                falls back to market (or is abandoned by the chase guard), so
   #                paper reflects that passive limits don't always fully fill.
-  paper_limit_fill_model: "optimistic"   # optimistic | realistic
+  # DEFAULT realistic: a breakout limit at the signal price often misses (price gaps
+  # up) and is market-chased, so paper must pay that slippage. `optimistic` made paper
+  # best-case, biasing it ABOVE both the slippage-paying backtest and live - which
+  # contaminated the ops-agent live-vs-backtest comparison and flattered paper
+  # validation. Realistic aligns paper ~ backtest ~ live (honest measurement).
+  paper_limit_fill_model: "realistic"    # optimistic | realistic
   paper_limit_fill_ratio: 0.7            # realistic: fraction filled at the limit
   # Don't-chase guard (sim + live): if the market FALLBACK would execute more than
   # this far above the intended/signal price, ABANDON the entry instead of chasing a
