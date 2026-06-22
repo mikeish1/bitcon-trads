@@ -32,6 +32,10 @@ BOTS: dict[str, str] = {
     "spot": "src.main_loop",
     "carry": "src.carry.main",
     "etf": "src.etf.main",
+    # Read-only monitoring dashboard (FastAPI). Opt-in via RUN_BOTS=spot,web. It
+    # opens the shared SQLite file READ-ONLY and never places orders, so it can run
+    # alongside any bot safely. Needs `pip install -r requirements-web.txt`.
+    "web": "web.main",
 }
 
 _GRACE_SECONDS = 15          # how long to wait for children to exit on shutdown

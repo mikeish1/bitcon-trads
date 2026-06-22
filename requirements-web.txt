@@ -1,0 +1,14 @@
+# =============================================================================
+# Web-dashboard ONLY requirements (read-only monitoring/ops layer).
+#
+# These are intentionally NOT in requirements.txt: the trading bots
+# (src.main_loop / src.run_all) must stay dependency-light and never import the
+# web stack. Install only when running the dashboard child:
+#     pip install -r requirements-web.txt
+# and enable it with RUN_BOTS=spot,web (see web/main.py + docs/DASHBOARD_ARCHITECTURE.md).
+# =============================================================================
+fastapi>=0.111,<0.116
+uvicorn[standard]>=0.30,<0.35
+httpx>=0.27,<0.29
+# pydantic v2 + loguru already come in via the base requirements (FastAPI pins
+# pydantic>=2; loguru is used by the bot). Listed here for clarity, not re-pinned.
