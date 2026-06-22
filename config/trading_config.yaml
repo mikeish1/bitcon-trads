@@ -202,6 +202,13 @@ strategy:
       rebalance_days: 2       # rotate at most every N days (RISK exits still any day)
       lookback_days: 90       # momentum = close / close N days ago - 1
       keep_band: 1            # hysteresis: keep a held coin until rank > top_k+keep_band
+      # Concentration cap: live rotation lets winners RUN (whole-position, never
+      # trimmed) - validated as comparable to the rebalanced backtest at HALF the
+      # turnover (src/profit_taking_research.py: C2 whole-pos vs C2 rebal). To bound
+      # single-name tail risk, trim any held name above cap_mult x (equity/top_k) back
+      # to the cap at each rebalance. Validated to lift full-period return + cut maxDD
+      # vs uncapped whole-position. null = off (winners run unbounded).
+      concentration_cap_mult: 1.5    # null = off; 1.5 = no name past 1.5/K of equity
       # --- Ranking signal: "simple" = the validated N-day ROC (default). ---------
       # "composite" ranks by a normalized weighted blend of breakout strength,
       # short + long ROC, relative strength vs BTC, and an inverse-vol/liquidity
