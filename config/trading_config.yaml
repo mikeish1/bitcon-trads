@@ -24,11 +24,72 @@ universe:
   bases: [BTC, ETH, SOL, XRP, DOGE, ADA]
   overrides: {}              # optional per-asset tuning, e.g. {ETH: {entry_period: 30}}
 
+  # --- Disciplined universe expansion (gated; never auto-applied) -------------
+  # New coins are added to `bases` ONLY after they clear strict liquidity +
+  # correlation gates AND demonstrate a portfolio-level benefit in a backtest.
+  # `candidates` are merely PROPOSED; `approved_expanded_universe` is filled by a
+  # human after running `python -m src.universe_expansion_research` and reviewing
+  # the report. The live bot still trades `bases`; this section is process, not a
+  # runtime switch. See src/universe.py + src/universe_expansion_research.py.
+  expansion:
+    enabled: false
+    candidates: [AVAX, LINK, LTC, DOT]   # liquid majors proposed for evaluation
+    validation_lookback: 365             # days of history the gates/backtest use
+    # Validated 2026-06 via `python -m src.universe_expansion_research` (4y daily):
+    #   LTC  APPROVED - corr 0.85 (<=0.90); diversification PASS (portfolio vol
+    #                   -0.8%, turnover +17.6% < 50%). Cleared correlation + benefit.
+    #   AVAX rejected - no diversification benefit (vol +1.6%, Calmar -0.02).
+    #   LINK rejected - correlation 0.93 with ETH (> 0.90).
+    #   DOT  rejected - too illiquid even at a venue-calibrated floor.
+    # LTC is staged here but NOT added to `bases`: its Binance.US ADV (~$25k/day) is
+    # in line with thin incumbents (ADA/BNB/DOGE) yet below the conservative global
+    # liquidity floor. Flip it into `bases` only after calibrating
+    # liquidity_filters.min_avg_daily_volume_usdt to the live venue's volume scale.
+    approved_expanded_universe: [LTC]    # populated ONLY after gates pass (with evidence)
+
+# --- Liquidity + correlation gates for universe expansion -------------------
+# Quantitative bars a candidate coin must clear before it can be approved. Tuned
+# for daily spot majors; tighten for a more conservative book.
+liquidity_filters:
+  # NOTE: the absolute floor is calibrated for LIQUID GLOBAL venues. Binance.US alt
+  # volume is far thinner (even BTC reads ~$3.5M/day in its data), so for a
+  # Binance.US-only book either lower this floor to the venue's scale or lean on the
+  # relative floor below. Run `python -m src.universe_expansion_research` to see the
+  # member ADV reference before setting it.
+  min_avg_daily_volume_usdt: 30000000.0  # absolute >= $30M/day rolling-average dollar volume
+  min_relative_to_median_pct: 0.5        # AND >= 50% of the median existing-member ADV (venue-relative)
+  volume_window: 30                      # rolling window (days) for the volume test
+  max_pairwise_correlation: 0.90         # reject if daily-return corr with ANY member exceeds this
+  correlation_lookback: 180              # window (days) for the correlation test
+  min_vol_reduction_pct: 0.0             # require portfolio realized vol not to worsen (>=0)
+  min_calmar_improvement: 0.0            # require portfolio Calmar not to worsen (>=0)
+  max_turnover_increase_pct: 0.50        # reject if adding the coin raises switch count > 50%
+
 # --- Portfolio-level risk controls (across ALL coins) -----------------------
 portfolio:
   max_concurrent_positions: 3   # never hold more than this many coins at once
   max_total_exposure_pct: 0.90  # LEGACY default envelope (of equity); see capital_policy
   per_asset_alloc_pct: 0.30     # cap any single position at this fraction of equity
+
+  # --- Thin sleeve overlay (meta-allocation across the 3 sibling bots) --------
+  # A LIGHTWEIGHT overlay that computes target weights across the Donchian, Carry
+  # and ETF sleeves from each sleeve's recent equity curve. It is INFORMATIONAL by
+  # default (logged once/day, no capital is moved) and never duplicates any bot's
+  # risk/execution/data logic - the three bots keep running independently. A future
+  # meta-runner can read these weights to notionally re-allocate. See
+  # src/portfolio_sleeve_allocator.py and docs/SLEEVE_ALLOCATOR.md.
+  sleeves:
+    enabled: false                  # true -> log daily target weights in the spot loop
+    members: [donchian, carry, etf]
+    allocator_mode: "risk_parity"   # "risk_parity" (inverse-vol) | "momentum_of_strategies"
+    lookback_days: 60               # window for sleeve return/vol/Sharpe
+    min_weight: 0.15                # per-sleeve floor (sum-to-1 after clamping)
+    max_weight: 0.60                # per-sleeve ceiling
+    rebalance_threshold: 0.10       # only move weights when max drift > this (anti-churn)
+    momentum_metric: "sharpe"       # "sharpe" | "return" (momentum_of_strategies mode)
+    momentum_tilt: 0.5              # 0 = equal weight .. 1 = full tilt toward winners
+    regime_boost_factor: 0.20       # boost the Donchian weight this much when BTC risk-on
+    vol_floor: 0.001                # floor on sleeve daily vol (avoids divide-by-zero)
 
 # --- Deployable-capital limit (THE master cap; user-adjustable) -------------
 # The single, centralized ceiling on how much capital the system may have
@@ -241,12 +302,105 @@ safety:
 
 execution:
   taker_fee_pct: 0.001        # Binance.US spot taker fee (~0.10%)
-  paper_slippage_pct: 0.0007  # simulated slippage on paper fills
+  maker_fee_pct: 0.001        # maker fee (~0.10%); used by post-only fills + cost model
+  paper_slippage_pct: 0.0007  # simulated MARKET-order slippage on paper fills
+
+  # --- Limit orders on entry (reduce taker slippage; market fallback) ----------
+  # A breakout entry is placed as a LIMIT order near the signal price; if it does
+  # not fill within the timeout it is cancelled and re-sent as a MARKET order so a
+  # genuine breakout is never missed. Exits keep their existing market/stop logic.
+  # In paper/sim the limit is modelled as filling at the limit price (capturing the
+  # offset as price improvement vs the market-slippage path) - optimistic on fills;
+  # use the backtester's slippage knob for the pessimistic miss case.
+  use_limit_orders_on_entry: true
+  entry_limit_offset_bps: 0       # limit = price*(1 + offset/1e4); <0 = passive/maker-seeking
+  limit_order_timeout_sec: 60     # cancel + market-fallback after this long unfilled (live)
+  limit_poll_interval_sec: 3      # how often to poll the resting limit (live)
+  post_only: false                # exchange post-only (maker-only) where supported
+  # Paper/sim fill realism (live fills are always real):
+  #   optimistic - the limit fills in full at the limit price (best case; default).
+  #   realistic  - only `paper_limit_fill_ratio` fills at the limit; the remainder
+  #                falls back to market (or is abandoned by the chase guard), so
+  #                paper reflects that passive limits don't always fully fill.
+  paper_limit_fill_model: "optimistic"   # optimistic | realistic
+  paper_limit_fill_ratio: 0.7            # realistic: fraction filled at the limit
+  # Don't-chase guard (sim + live): if the market FALLBACK would execute more than
+  # this far above the intended/signal price, ABANDON the entry instead of chasing a
+  # breakout that already ran away (models the real opportunity-miss cost). 0 = off.
+  max_entry_chase_bps: 0
+
+  # --- Slippage instrumentation (intended vs actual fill; bps + USD) -----------
+  # Every fill is recorded to the `fills` table; query with `python -m src.slippage`.
+  slippage_logging_enabled: true
+  max_slippage_tolerance_bps: 50  # warn (and flag) when adverse slippage exceeds this
+
+  # --- Cost-aware pair preference (low-turnover Donchian is spread/fee sensitive) -
+  #   off    - no effect (default; fully backward-compatible).
+  #   soft   - cheaper coins are favoured as a tie-breaker (ordering / score penalty).
+  #   strict - coins whose effective round-trip cost exceeds max_effective_cost_bps
+  #            are dropped from the tradable universe each cycle.
+  # Effective cost = 2 x taker fee + spread_factor x a daily-range spread proxy.
+  cost_preference_mode: "off"     # off | soft | strict
+  max_effective_cost_bps: 60      # strict-mode ceiling on round-trip effective cost
+  cost_penalty_weight: 1.0        # soft-mode penalty scaler on the cost tilt
+  spread_proxy_window: 20         # days for the (high-low)/close spread proxy
+  spread_proxy_factor: 0.1        # maps daily range -> an intraday spread estimate
+  # When true, score cost from REAL data: venue maker/taker tiers + live bid/ask
+  # spreads (absolute bps). Falls back to the daily-range proxy per-symbol when a
+  # quote is unavailable (offline / backtest). Adds one ticker fetch per coin/cycle.
+  cost_use_live_quotes: false
+  fee_overrides: {}               # optional per-base taker/maker override, e.g. {BTC: {taker: 0.0008}}
 
 claude:
   model: "claude-haiku-4-5"   # cheap; override with CLAUDE_MODEL env var
   max_tokens: 1024
   daily_summary_hour_utc: 0
+
+# --- Trading-ops agent (live-vs-backtest feedback loop; human-gated) ----------
+# A daily/weekly agent that compares LIVE performance to a walk-forward BACKTEST,
+# flags statistically significant degradation, and proposes a FEW narrow parameter
+# changes. It NEVER applies anything itself - proposals land in ops/proposals/ as
+# `pending` and a human approves + applies them via the CLI (see docs/OPS_AGENT.md).
+# Read-only by default; enabling only turns on the analysis + proposal WRITING.
+ops_agent:
+  enabled: false
+  comparison:
+    live_lookback_days: 60        # live window compared against the backtest
+    backtest_window_months: 24    # walk-forward reference window
+    min_live_days: 20             # below this -> report only, never propose
+  thresholds:
+    pvalue: 0.05                  # MWU / Welch significance for return-distribution flags
+    dd_z: 2.0                     # sigma below the backtest distribution to flag a window metric
+    slippage_alert_bps: 25        # flag when avg live slippage exceeds this
+  research:
+    min_improvement_pct: 0.15     # promote a sweep winner only if OOS MAR beats live by >= 15%
+    entry_grid: [30, 40, 55]      # entry_period values swept on recent data
+    atr_grid: [2.5, 3.0, 3.5]     # atr_trail_mult values swept on recent data
+  # Persist the (expensive) walk-forward baseline + research sweeps as fingerprinted
+  # JSON artifacts: subsequent runs LOAD the cached baseline (reproducible + fast +
+  # auditable) instead of recomputing, until the inputs/data change or the TTL lapses.
+  artifacts:
+    enabled: true
+    dir: "ops/artifacts"
+    ttl_hours: 24
+  proposals:
+    approval_mode: "manual"       # manual (human gate) | off (analyze only, never propose)
+    max_per_run: 3                # cap on proposals per run (err on fewer)
+    proposals_dir: "ops/proposals"
+    audit_log: "ops/audit.log"
+    # ALLOWLIST: the ONLY keys the agent may propose, each with bounds + type. Safety
+    # rails, capital policy and portfolio caps are deliberately ABSENT (and blocked).
+    tunable_keys:
+      strategy.donchian.entry_period:        {min: 20, max: 80, type: int}
+      strategy.donchian.atr_trail_mult:      {min: 2.0, max: 4.5}
+      exits.atr_trail_mult:                  {min: 2.0, max: 3.5}
+      risk.risk_per_trade_pct:               {min: 0.003, max: 0.02}
+      risk.risk_budget.risk_per_trade_pct:   {min: 0.003, max: 0.02}
+      strategy.vol_target.target_daily_vol:  {min: 0.02, max: 0.06}
+    # Hard blocklist (never proposable, even if mistakenly allowlisted):
+    blocked_keys: [safety, capital_policy, portfolio.max_total_exposure_pct,
+                   portfolio.per_asset_alloc_pct, portfolio.max_concurrent_positions,
+                   risk.max_position_pct, runtime]
 
 logging:
   level: "INFO"

@@ -32,8 +32,10 @@ from src.claude_orchestrator import ClaudeOrchestrator
 from src.config import load_config
 from src.data_pipeline import DataPipeline, build_exchange
 from src.executor import SpotExecutor
+from src.cost_model import universe_costs, live_costs, cost_preference_mode, cost_penalty
 from src.momentum_allocator import MomentumRotation
 from src.notifications import Notifier
+from src.portfolio_sleeve_allocator import SleeveAllocator, build_sleeve_performance
 from src.regime import RegimeState, regime_from_config
 from src.risk_manager import RiskManager
 from src.strategy import Strategy, DonchianStrategy
@@ -84,6 +86,21 @@ class TradingBot:
         self.regime_tighten_trail = rg.get("tighten_trail_mult", None) if self.regime_new else None
         self._regime = RegimeState(True, 1.0, 1.0, "init", "startup (assume risk-on)")
         self._pvol: float | None = None    # expected portfolio daily-vol proxy (for vol targeting)
+
+        # Optional thin sleeve overlay: logs daily target weights across the three
+        # sibling sleeves. INFORMATIONAL only - it never changes this bot's sizing,
+        # and the carry/ETF bots are untouched. Default off.
+        self.sleeves_enabled = bool((sd_pf := self.cfg.get("portfolio", {}) or {})
+                                    .get("sleeves", {}).get("enabled", False))
+        self._sleeve_alloc = SleeveAllocator(self.cfg) if self.sleeves_enabled else None
+        self._sleeve_prev: Optional[dict[str, float]] = None
+
+        # Cost-aware pair preference (off | soft | strict). Effective round-trip cost
+        # per coin is recomputed each cycle from the live frames.
+        self.cost_mode = cost_preference_mode(self.cfg)
+        self.max_cost_bps = float(self.cfg["execution"].get("max_effective_cost_bps", 60.0))
+        self.cost_use_live_quotes = bool(self.cfg["execution"].get("cost_use_live_quotes", False))
+        self._costs: dict[str, float] = {}
 
         # Allocation mode: first_come (default) or momentum_rotation.
         self.alloc_mode = sd.get("allocation", {}).get("mode", "first_come")
@@ -227,13 +244,30 @@ class TradingBot:
         if any_ts is not None:
             self._maybe_summary(any_ts, equity)
 
+        # Cost-aware preference: effective round-trip cost per coin (off -> empty).
+        # Real venue fees + live spreads when enabled, else the daily-range proxy.
+        if self.cost_mode != "off":
+            frames_by_sym = {sym: s["frames"] for sym, s in snap.items()}
+            if self.cost_use_live_quotes:
+                self._costs = live_costs(frames_by_sym, self.exchange, self.cfg, self.primary_tf)
+            else:
+                self._costs = universe_costs(frames_by_sym, self.cfg, self.primary_tf)
+
         # Entry phase. Two allocation modes:
         if self.alloc_mode == "momentum_rotation":
             self._rotate(snap, equity, avail_quote, open_value, n_open)
         else:
             # first_come: each flat symbol with a freshly closed candle is sized alone.
-            for sym, s in snap.items():
+            # SOFT cost mode trades the cheapest-to-execute breakouts first (so the
+            # limited exposure budget favours low-cost coins); STRICT skips coins
+            # whose effective cost exceeds the ceiling.
+            items = list(snap.items())
+            if self.cost_mode == "soft" and self._costs:
+                items.sort(key=lambda kv: self._costs.get(kv[0], 1e9))
+            for sym, s in items:
                 if self.risk.open_position(sym) is not None:
+                    continue
+                if self.cost_mode == "strict" and self._costs.get(sym, 0.0) > self.max_cost_bps:
                     continue
                 if s["ts"] == self._last_candle_ts.get(sym):
                     continue
@@ -315,7 +349,7 @@ class TradingBot:
                         sizing["vol_scalar"], sizing["regime_factor"])
 
         price = s["price"]
-        fill = self.executor.market_buy(sym, sizing["spend_usd"], price)
+        fill = self.executor.open_buy(sym, sizing["spend_usd"], price, intended_price=price)
         if fill is None:
             return 0.0
         stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
@@ -359,6 +393,16 @@ class TradingBot:
                 active_frames[sym] = s["frames"]
         btc_frames = snap.get(f"BTC/{self._quote}", {}).get("frames")
         cands = self.rotation.score_candidates(active_frames, btc_frames)
+        # Cost-aware preference on the candidate scores: STRICT drops dear coins;
+        # SOFT applies a small cost penalty as a tie-breaker (never overrides regime
+        # or active-trend gates, which already filtered `active_frames`).
+        if self.cost_mode == "strict" and self._costs:
+            dropped = [s for s in cands if self._costs.get(s, 0.0) > self.max_cost_bps]
+            if dropped:
+                logger.info("Cost filter (strict): dropping {} (> {} bps).", dropped, self.max_cost_bps)
+            cands = {s: v for s, v in cands.items() if self._costs.get(s, 0.0) <= self.max_cost_bps}
+        elif self.cost_mode == "soft" and self._costs:
+            cands = {s: v - cost_penalty(s, self._costs, self.cfg) for s, v in cands.items()}
         held = [p["symbol"] for p in self.risk.open_positions()]
         plan = self.rotation.plan(cands, held)
         if plan["exit"] or plan["enter"]:
@@ -409,7 +453,7 @@ class TradingBot:
                         sym, sizing["spend_usd"])
             return 0.0
         price = s["price"]
-        fill = self.executor.market_buy(sym, sizing["spend_usd"], price)
+        fill = self.executor.open_buy(sym, sizing["spend_usd"], price, intended_price=price)
         if fill is None:
             return 0.0
         stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
@@ -543,6 +587,40 @@ class TradingBot:
         note = self.claude.daily_summary(stats)
         logger.info("DAILY SUMMARY ({})\n{}\n{}", day, note, stats)
         self.notifier.summary(stats, note)
+        self._maybe_log_sleeve_targets()
+        self._maybe_run_ops_agent()
+
+    def _maybe_run_ops_agent(self) -> None:
+        """Optional daily ops check (read-only analysis + WRITES pending proposals to
+        the approval gate; never applies anything). Off unless ops_agent.enabled.
+        Wrapped so a failure can never disturb the trading loop."""
+        if not (self.cfg.get("ops_agent", {}) or {}).get("enabled", False):
+            return
+        try:
+            from src.claude_orchestrator import OpsAgent
+            OpsAgent(self.cfg, orchestrator=self.claude).run_daily_ops()
+        except Exception as exc:
+            logger.warning("Ops agent daily run skipped: {}", exc)
+
+    def _maybe_log_sleeve_targets(self) -> None:
+        """Informational meta-view: compute target weights across the Donchian,
+        Carry and ETF sleeves from each sleeve's recent equity (read read-only from
+        the shared DB) and log them. Never moves capital; wrapped so a failure can
+        never disturb the trading loop. Off unless portfolio.sleeves.enabled."""
+        if not self.sleeves_enabled or self._sleeve_alloc is None:
+            return
+        try:
+            perf = build_sleeve_performance(self.cfg["runtime"]["db_path"], self.cfg)
+            if not perf:
+                logger.info("Sleeve overlay: insufficient sleeve history yet - skipping.")
+                return
+            regime = {"risk_on": self._regime.risk_on} if self.regime_enabled else None
+            weights = self._sleeve_alloc.compute_weights(
+                perf, regime_state=regime, prev_weights=self._sleeve_prev)
+            self._sleeve_prev = weights
+            logger.info("Sleeve target weights (informational, no capital moved): {}", weights)
+        except Exception as exc:
+            logger.warning("Sleeve overlay skipped: {}", exc)
 
 
 def main() -> None:
