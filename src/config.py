@@ -77,6 +77,12 @@ def load_config() -> dict[str, Any]:
 
     cfg["market"]["symbol"] = os.getenv("SYMBOL", default_symbol)
 
+    # Confirmed-closed-candle signal discipline (present-by-default; env flip).
+    cfg.setdefault("market", {})
+    cfg["market"].setdefault("signal_on_closed_candle", True)
+    if os.getenv("SIGNAL_ON_CLOSED_CANDLE") is not None:
+        cfg["market"]["signal_on_closed_candle"] = _env_bool("SIGNAL_ON_CLOSED_CANDLE", True)
+
     # --- Dynamic multi-asset universe ---
     quote = "USD" if is_alpaca else "USDT"          # quote currency per venue
     cfg["quote_ccy"] = quote

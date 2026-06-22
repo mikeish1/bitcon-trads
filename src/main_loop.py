@@ -71,6 +71,10 @@ class TradingBot:
 
         self.primary_tf = self.cfg["market"]["primary_timeframe"]
         self.poll_seconds = self.cfg["market"]["poll_seconds"]
+        # Decide signals on the last CONFIRMED-CLOSED candle (matches the close-based
+        # backtest; makes a mid-candle restart deterministic instead of evaluating an
+        # intraday level vs the prior high). Marking/sizing still use the live price.
+        self.signal_on_closed = bool(self.cfg["market"].get("signal_on_closed_candle", True))
         self.use_exchange_stop = self.cfg["exits"]["use_exchange_stop"]
         self.overrides = self.cfg["universe"].get("overrides", {}) or {}
         sd = self.cfg["strategy"]
@@ -214,11 +218,17 @@ class TradingBot:
             except Exception as exc:
                 logger.warning("{} data fetch failed: {}", sym, exc)
                 continue
-            last = frames[self.primary_tf].iloc[-1]
-            price = float(last["close"])
-            atr = float(last["atr"]) if "atr" in last and last["atr"] == last["atr"] else 0.0
-            snap[sym] = {"frames": frames, "price": price, "atr": atr, "ts": last["timestamp"]}
-            prices[_base_of(sym)] = price
+            # LIVE price (current, in-progress candle) for marking / sizing / orders.
+            live_price = float(frames[self.primary_tf].iloc[-1]["close"])
+            # SIGNAL view: decide entries/exits/regime/momentum + read the sizing ATR
+            # on the last CONFIRMED-CLOSED candle, so live matches the backtest and a
+            # mid-candle restart can't trade an unconfirmed intraday breakout.
+            sig_frames = self.data.closed_frames(frames) if self.signal_on_closed else frames
+            sig_last = sig_frames[self.primary_tf].iloc[-1]
+            atr = float(sig_last["atr"]) if "atr" in sig_last and sig_last["atr"] == sig_last["atr"] else 0.0
+            snap[sym] = {"frames": sig_frames, "price": live_price, "atr": atr,
+                         "ts": sig_last["timestamp"]}
+            prices[_base_of(sym)] = live_price
 
         # Market regime: is BTC in an uptrend? (gates entries + forces risk-off exits)
         self._update_regime(snap)
@@ -288,8 +298,13 @@ class TradingBot:
         ref_sym = f"{self.regime_ref}/{self._quote}"
         bf = None
         try:
-            bf = (snap[ref_sym]["frames"][self.primary_tf] if ref_sym in snap
-                  else self.data.get_frames(ref_sym)[self.primary_tf])
+            if ref_sym in snap:                       # already the confirmed-close view
+                bf = snap[ref_sym]["frames"][self.primary_tf]
+            else:
+                fetched = self.data.get_frames(ref_sym)
+                if self.signal_on_closed:
+                    fetched = self.data.closed_frames(fetched)
+                bf = fetched[self.primary_tf]
         except Exception as exc:
             logger.warning("{} regime check failed ({}); assuming risk-on.", ref_sym, exc)
         new = regime_from_config(bf, self.cfg)   # fail-open to risk-on inside
