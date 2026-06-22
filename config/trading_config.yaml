@@ -490,6 +490,10 @@ etf:
   primary_timeframe: "1d"
   backfill_days: 400               # daily bars on startup (~1.6y; warms indicators)
   poll_seconds: 3600               # daily strategy; hourly poll is ample
+  # Decide signals on the last CONFIRMED-CLOSED daily bar (recommended). During the
+  # session the latest bar is still forming; selecting on it diverges from the close-
+  # based backtest. Marking/sizing keep the live price. Env: ETF_SIGNAL_ON_CLOSED_CANDLE.
+  signal_on_closed_candle: true
   # Diversified, liquid ETFs across asset classes (equities/intl/bonds/gold/cmdty/RE).
   universe: [SPY, QQQ, IWM, EFA, EEM, TLT, IEF, GLD, DBC, VNQ]
   selection:

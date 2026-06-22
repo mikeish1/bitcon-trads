@@ -75,6 +75,16 @@ class EtfBot:
             logger.error("No tradable ETF symbols on {}. Exiting.", self.rt["venue"])
             return
         logger.info("Universe ({}): {}", len(self.symbols), ", ".join(self.symbols))
+
+        # Startup reconcile (live): close DB positions the broker no longer holds
+        # (external/manual close, full liquidation, delisting) so the ledger can't
+        # drift from the account. No-op in sim.
+        if self.rt["place_orders"]:
+            try:
+                self.risk.reconcile(self.broker.positions(), {})
+            except Exception as exc:
+                logger.warning("ETF startup reconcile skipped: {}", exc)
+
         self.notifier.message(f"📈ETF momentum bot started\nMode: {self._mode}\n"
                               f"Universe: {', '.join(self.symbols)}")
         while self.running:
@@ -104,21 +114,25 @@ class EtfBot:
         frames_by_symbol: dict[str, dict[str, pd.DataFrame]] = {}
         prices: dict[str, float] = {}
         latest_ts = None
+        market_open = self.broker.is_market_open()   # once per cycle (one clock call)
         for sym in self.symbols:
             try:
                 frames = self.data.frames(sym)
             except Exception as exc:
                 logger.warning("{} data fetch failed: {}", sym, exc)
                 continue
-            frames_by_symbol[sym] = frames
+            # LIVE price (current session bar) for marking / sizing / orders; SIGNALS
+            # decide on the last CONFIRMED-CLOSED bar so live matches the backtest.
             prices[sym] = self.data.last_price(frames)
-            ts = frames[self.tf].iloc[-1]["timestamp"]
+            sig = self.data.closed_view(frames, market_open)
+            frames_by_symbol[sym] = sig
+            ts = sig[self.tf].iloc[-1]["timestamp"]
             latest_ts = ts if latest_ts is None else max(latest_ts, ts)
         if not frames_by_symbol or latest_ts is None:
             return
 
         # Live: never place orders when the equities market is closed.
-        if self.rt["place_orders"] and not self.broker.is_market_open():
+        if self.rt["place_orders"] and not market_open:
             logger.info("ETF market closed - holding; no rebalance this poll.")
             return
 

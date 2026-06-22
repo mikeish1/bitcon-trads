@@ -156,6 +156,22 @@ class EtfRiskManager:
                     fill["price"], pnl, reason)
         return pnl
 
+    def reconcile(self, broker_positions: dict[str, float], prices: dict[str, float]) -> None:
+        """Close any OPEN DB position the broker no longer holds (external/manual close,
+        full liquidation, delisting). Broker mode only. Only the 'position gone' case is
+        handled - splits / partial external changes are left for a human, mirroring the
+        spot bot's reconcile - so we never misstate a cost basis automatically."""
+        if not self.uses_broker:
+            return
+        for pos in self.open_positions():
+            sym = pos["symbol"]
+            price = prices.get(sym, pos["entry_price"])
+            dust = self.min_notional / price if price else 0.0
+            if broker_positions.get(sym, 0.0) < dust and pos["qty"] > dust:
+                logger.warning("ETF reconcile: {} not held at broker - closing (external fill).", sym)
+                self.record_close(pos, {"price": price, "qty": pos["qty"], "fee": 0.0},
+                                  "reconcile: not held at broker")
+
     def daily_stats(self, equity: float) -> dict[str, Any]:
         return {
             "mode": self.mode,
