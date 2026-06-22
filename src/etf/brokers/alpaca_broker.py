@@ -126,6 +126,23 @@ class AlpacaBroker(EtfBroker):
             time.sleep(_FILL_POLL_SECONDS)
         return order
 
+    @staticmethod
+    def _fill_from_order(order: Any, price_hint: float, side: str) -> Optional[dict[str, Any]]:
+        """Build a fill dict from a (possibly partial) order. Returns None when NOTHING
+        filled, so the caller never records a PHANTOM position from a market order that
+        timed out unfilled. Uses the actual filled qty + avg price (price_hint only as a
+        last resort when a confirmed fill omits the average)."""
+        filled = float(getattr(order, "filled_qty", None) or 0.0)
+        if filled <= 0:
+            return None
+        avg = getattr(order, "filled_avg_price", None)
+        price = float(avg) if avg else price_hint
+        out: dict[str, Any] = {"id": str(getattr(order, "id", "")), "qty": filled,
+                               "price": price, "fee": 0.0}
+        if side == "buy":
+            out["cost"] = filled * price
+        return out
+
     def market_buy(self, symbol: str, notional_usd: float,
                    price_hint: float) -> Optional[dict[str, Any]]:
         if not self._place:
@@ -135,10 +152,11 @@ class AlpacaBroker(EtfBroker):
             req = self._MarketOrderRequest(symbol=symbol, notional=round(notional_usd, 2),
                                            side=self._OrderSide.BUY,
                                            time_in_force=self._TimeInForce.DAY)
-            order = self._await_fill(self._trading.submit_order(req).id)
-            qty = float(order.filled_qty or 0.0) or (notional_usd / price_hint)
-            price = float(order.filled_avg_price) if order.filled_avg_price else price_hint
-            return {"id": str(order.id), "qty": qty, "price": price, "cost": qty * price, "fee": 0.0}
+            fill = self._fill_from_order(self._await_fill(self._trading.submit_order(req).id),
+                                         price_hint, "buy")
+            if fill is None:
+                logger.warning("Alpaca BUY {} did not fill within timeout - no position recorded.", symbol)
+            return fill
         except Exception as exc:
             logger.error("Alpaca BUY {} failed: {}", symbol, exc)
             return None
@@ -152,10 +170,11 @@ class AlpacaBroker(EtfBroker):
             req = self._MarketOrderRequest(symbol=symbol, qty=round(qty, 6),
                                            side=self._OrderSide.SELL,
                                            time_in_force=self._TimeInForce.DAY)
-            order = self._await_fill(self._trading.submit_order(req).id)
-            filled = float(order.filled_qty or 0.0) or qty
-            price = float(order.filled_avg_price) if order.filled_avg_price else price_hint
-            return {"id": str(order.id), "qty": filled, "price": price, "fee": 0.0}
+            fill = self._fill_from_order(self._await_fill(self._trading.submit_order(req).id),
+                                         price_hint, "sell")
+            if fill is None:
+                logger.warning("Alpaca SELL {} did not fill within timeout - position unchanged.", symbol)
+            return fill
         except Exception as exc:
             logger.error("Alpaca SELL {} failed: {}", symbol, exc)
             return None

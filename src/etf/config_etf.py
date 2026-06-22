@@ -32,6 +32,11 @@ def load_etf_config() -> dict[str, Any]:
         e["universe"] = [s.strip().upper() for s in uni_env.split(",") if s.strip()]
     e.setdefault("universe", ["SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "IEF", "GLD", "DBC", "VNQ"])
     e.setdefault("poll_seconds", 3600)
+    # Decide signals on the last CONFIRMED-CLOSED daily bar (recommended). During the
+    # session the most recent daily bar is still forming, so selecting on it diverges
+    # from the close-based backtest; marking/sizing still use the live price.
+    e["signal_on_closed_candle"] = _env_bool(
+        "ETF_SIGNAL_ON_CLOSED_CANDLE", bool(e.get("signal_on_closed_candle", True)))
 
     sel = e.setdefault("selection", {})
     sel.setdefault("entry_period", 40)
