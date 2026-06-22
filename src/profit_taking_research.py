@@ -103,7 +103,9 @@ def baseline_asset(df: pd.DataFrame, entry: int, atr_mult: float,
 def scaleout_asset(df: pd.DataFrame, entry: int, regime_on: pd.Series | None,
                    capital: float, fee: float, slip: float,
                    scale_pcts: list[float], scale_atr: list[float],
-                   ratchet: list[float]) -> Run:
+                   ratchet: list[float],
+                   breakeven_after_tier: int = 0,
+                   breakeven_buffer_atr: float = 0.0) -> Run:
     """
     Faithful long-only state machine (no lookahead; no constant-fraction churn):
 
@@ -115,7 +117,13 @@ def scaleout_asset(df: pd.DataFrame, entry: int, regime_on: pd.Series | None,
           position ONCE (tranche profit-taking); the remainder rides on,
         * chandelier multiple tightens by profit tier (ratchet[]): base ratchet[0],
           and after crossing scale_atr[k] it uses ratchet[k+1] (tighter),
-        * EXIT the remainder when close < peak - mult*ATR, or on regime-off.
+        * once `breakeven_after_tier` (>0) tranches have fired, the stop is also
+          floored at entry + `breakeven_buffer_atr`*ATR_at_entry - this MIRRORS the
+          live main_loop._manage breakeven lock (risk_manager.profit_taking_plan).
+          With breakeven_after_tier=0 the floor is OFF (the original validated B),
+          so callers can compare the validated logic to the TRUE live logic.
+        * EXIT the remainder when close < max(peak - mult*ATR, breakeven_floor),
+          or on regime-off.
     """
     close = df["close"].to_numpy()
     high = df["high"].to_numpy()
@@ -167,10 +175,14 @@ def scaleout_asset(df: pd.DataFrame, entry: int, regime_on: pd.Series | None,
                 sell(orig_units * scale_pcts[tranche], price, i)
                 tranche += 1
 
-            # 2) ratcheting chandelier exit on the remainder
+            # 2) ratcheting chandelier exit on the remainder, plus the live
+            #    breakeven floor once enough tiers have fired (mirrors the live
+            #    current_stop = max(chandelier, entry + buffer*ATR) lock).
             if units > 0:
                 mult = chandelier_mult(profit_atr)
                 stop = peak - mult * atr[i] if atr[i] == atr[i] else -np.inf
+                if breakeven_after_tier > 0 and tranche >= breakeven_after_tier:
+                    stop = max(stop, entry_price + breakeven_buffer_atr * entry_atr)
                 if reg[i] <= 0 or price < stop:
                     sell(units, price, i)
                     invested = False
@@ -463,10 +475,28 @@ def main() -> None:
         base_runs = {b: baseline_asset(frames[b], entry, atr_mult, regime_on,
                                        capital / len(bases), fee, slip) for b in bases}
         A, A_bh, _ = equalweight_portfolio(base_runs, frames, "A baseline (live logic)")
-        # B: staged scale-out + ratcheting chandelier (the enhanced exit logic).
+        # B: staged scale-out + ratcheting chandelier, NO breakeven floor.
+        #    This is the originally-validated logic (the +15.2% OOS number).
         scale_runs = {b: scaleout_asset(frames[b], entry, regime_on, capital / len(bases),
                                         fee, slip, scale_pcts, scale_atr, ratchet) for b in bases}
-        B, _, _ = equalweight_portfolio(scale_runs, frames, "B scale-out+ratchet")
+        B, _, _ = equalweight_portfolio(scale_runs, frames, "B scale-out (no BE floor)")
+        # B2: SAME, but WITH the live breakeven floor from strategy.profit_taking
+        #     (breakeven_after_tier / breakeven_buffer_atr). This is the TRUE logic
+        #     main_loop.py runs once profit_taking.enabled=true - judge live on THIS.
+        be_after = int(pt.get("breakeven_after_tier", 1))
+        be_buf = float(pt.get("breakeven_buffer_atr", 0.5))
+        runs_b2 = {b: scaleout_asset(frames[b], entry, regime_on, capital / len(bases),
+                                     fee, slip, scale_pcts, scale_atr, ratchet,
+                                     breakeven_after_tier=be_after, breakeven_buffer_atr=be_buf)
+                   for b in bases}
+        B2, _, _ = equalweight_portfolio(runs_b2, frames, f"B2 +BE floor t{be_after} (LIVE)")
+        # B3: looser breakeven (arm only after BOTH tranches) - a candidate config
+        #     that protects the runner less aggressively, preserving more upside.
+        runs_b3 = {b: scaleout_asset(frames[b], entry, regime_on, capital / len(bases),
+                                     fee, slip, scale_pcts, scale_atr, ratchet,
+                                     breakeven_after_tier=len(scale_pcts), breakeven_buffer_atr=be_buf)
+                   for b in bases}
+        B3, _, _ = equalweight_portfolio(runs_b3, frames, f"B3 +BE floor t{len(scale_pcts)}")
         C1, C1_bh, cts = momentum_topk(frames, entry, atr_mult, regime_on, capital, fee, slip,
                                        args.topk, args.mom_lookback, "C1 momentum (daily)",
                                        rebalance_every=1, keep_band=0)
@@ -480,10 +510,10 @@ def main() -> None:
                                  f"C3 composite ({args.rebalance_every}d+band)",
                                  rebalance_every=args.rebalance_every, keep_band=args.keep_band,
                                  rank_mode="composite", roc_short=roc_short, comp_weights=comp_weights)
-        return A, A_bh, B, C1, C2, C3, cts
+        return A, A_bh, B, B2, B3, C1, C2, C3, cts
 
     def cost_section(title: str, fee: float, slip: float) -> list[str]:
-        A, A_bh, B, C1, C2, C3, cts = build(fee, slip)
+        A, A_bh, B, B2, B3, C1, C2, C3, cts = build(fee, slip)
         out = ["", "#" * 100, f"  {title}  (fee {fee:.2%}/side, slip {slip:.2%})", "#" * 100]
         for wname, mask_of in (("OUT-OF-SAMPLE (judge here)", lambda ts: ts > split),
                                ("FULL PERIOD", lambda ts: np.ones(len(ts), bool))):
@@ -491,6 +521,8 @@ def main() -> None:
             out.append(_row(A.name, metrics(A, mask_of(_eq_ts), A_bh.equity)))
             out.append(_row("   Buy & Hold (eq-wt)", metrics(A_bh, mask_of(_eq_ts), A_bh.equity)))
             out.append(_row(B.name, metrics(B, mask_of(_eq_ts), A_bh.equity)))
+            out.append(_row(B2.name, metrics(B2, mask_of(_eq_ts), A_bh.equity)))
+            out.append(_row(B3.name, metrics(B3, mask_of(_eq_ts), A_bh.equity)))
             out.append(_row(C1.name, metrics(C1, mask_of(cts), A_bh.equity)))
             out.append(_row(C2.name, metrics(C2, mask_of(cts), A_bh.equity)))
             out.append(_row(C3.name, metrics(C3, mask_of(cts), A_bh.equity)))

@@ -97,6 +97,33 @@ class DataPipeline:
         return float(frames[primary_tf].iloc[-1]["close"])
 
     # ------------------------------------------------------------------ #
+    # Confirmed-closed-candle view (signal integrity)                    #
+    # ------------------------------------------------------------------ #
+    def _drop_unclosed(self, df: pd.DataFrame, timeframe: str, now_ms: int) -> pd.DataFrame:
+        """Drop any trailing, still-FORMING candle so signals decide on confirmed
+        closes only. A candle opened at t is closed once t + timeframe <= now. Falls
+        back to the original frame if dropping would empty it (warm-up safety)."""
+        if df is None or len(df) == 0 or "timestamp" not in df.columns:
+            return df
+        try:
+            tf_ms = self.exchange.parse_timeframe(timeframe) * 1000
+        except Exception:
+            return df
+        cutoff = pd.Timestamp(now_ms - tf_ms, unit="ms", tz="UTC")
+        closed = df[df["timestamp"] <= cutoff]
+        return closed if len(closed) >= 1 else df
+
+    def closed_frames(self, frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """Return `frames` with any still-forming trailing candle dropped per
+        timeframe, so the strategy / regime / momentum decide on the last CONFIRMED
+        close (matching the close-based backtest and making restarts deterministic).
+        Indicators are unaffected by the drop - rolling values at earlier bars never
+        used the dropped bar. Equity marking + order placement must keep the live
+        price (frames' real iloc[-1] close), not this view."""
+        now_ms = self.exchange.milliseconds()
+        return {tf: self._drop_unclosed(df, tf, now_ms) for tf, df in frames.items()}
+
+    # ------------------------------------------------------------------ #
     # Account / universe                                                 #
     # ------------------------------------------------------------------ #
     def fetch_balances(self) -> dict[str, float]:

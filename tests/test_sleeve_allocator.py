@@ -32,6 +32,19 @@ def test_metrics_from_equity_basic():
     assert short["vol"] != short["vol"]            # NaN -> unusable
 
 
+def test_equal_weight_is_static_one_over_n():
+    # The validated winner: pure 1/N regardless of vol/sharpe, and crucially it does
+    # NOT drop sleeves for missing vol and is NOT tilted by the regime overlay.
+    a = SleeveAllocator(_cfg(allocator_mode="equal_weight"))
+    w = a.compute_weights({"donchian": {"vol": float("nan")},   # vol-less: kept anyway
+                           "carry": {"vol": 0.01}, "etf": {"vol": 0.02}},
+                          regime_state={"risk_on": True})        # must be ignored
+    assert sum(w.values()) == pytest.approx(1.0)
+    assert w["donchian"] == pytest.approx(1 / 3)
+    assert w["carry"] == pytest.approx(1 / 3)
+    assert w["etf"] == pytest.approx(1 / 3)
+
+
 def test_risk_parity_inverse_vol_with_clamp():
     w = SleeveAllocator(_cfg()).compute_weights(_vol(0.04, 0.01, 0.02))
     assert sum(w.values()) == pytest.approx(1.0)

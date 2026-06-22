@@ -104,6 +104,12 @@ class SleeveAllocator:
 
     def _raw_weights(self, metrics: dict[str, dict[str, Any]], mode: str) -> dict[str, float]:
         names = list(metrics)
+        if mode == "equal_weight":
+            # Static 1/N. VALIDATED best on the combined book (Calmar 0.95 vs
+            # risk_parity 0.88 / momentum 0.91; see docs/SLEEVE_ALLOCATOR.md): the
+            # uncorrelated low-vol carry sleeve does the diversifying, and the
+            # "clever" allocators give up return/Calmar trying to time the sleeves.
+            return {n: 1.0 / len(names) for n in names} if names else {}
         if mode == "momentum_of_strategies":
             key = "sharpe" if self.momentum_metric == "sharpe" else "ret"
             scores = {n: float(metrics[n].get(key, 0.0) or 0.0) for n in names}
@@ -186,16 +192,19 @@ class SleeveAllocator:
         """
         mode = (mode or self.mode).lower()
         metrics = self._coerce_metrics(performance)
-        # Drop sleeves with no usable vol in risk-parity (can't size them).
+        # Drop sleeves with no usable vol ONLY in risk-parity (it can't size them).
+        # equal_weight and momentum don't need vol, so they keep every member.
         usable = {n: m for n, m in metrics.items()
-                  if not (mode != "momentum_of_strategies" and (m.get("vol") is None or m.get("vol") != m.get("vol")))}
+                  if not (mode == "risk_parity" and (m.get("vol") is None or m.get("vol") != m.get("vol")))}
         if not usable:
             eq = {n: 1.0 / len(self.members) for n in self.members}
             logger.warning("SleeveAllocator: no usable sleeve metrics - equal weights {}.", _fmt(eq))
             return eq
 
         raw = self._raw_weights(usable, mode)
-        raw = self._apply_regime(raw, regime_state)
+        # equal_weight is deliberately static (the validated winner) - no regime tilt.
+        if mode != "equal_weight":
+            raw = self._apply_regime(raw, regime_state)
         weights = self._bound_and_normalize(raw)
 
         if prev_weights:
