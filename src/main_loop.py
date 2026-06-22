@@ -430,6 +430,12 @@ class TradingBot:
             if pos is not None and sym in snap:
                 self._exit(sym, pos, snap[sym]["price"], "rotation: out of top-K")
 
+        # 1b) Concentration cap: the live book lets winners RUN (never re-weighted),
+        #     so trim any name above cap_mult x (equity/top_k) back to the cap. Frees
+        #     cash for new leaders and bounds single-name tail risk. Off when null.
+        if self.rotation.cap_mult is not None:
+            self._trim_to_cap(snap)
+
         # 2) Rotation entries: strongest target coins we don't yet hold. Refresh
         #    equity/cash after the exits (paper updates instantly; a broker may lag
         #    a cycle - acceptable in paper, which is the default for this mode).
@@ -483,6 +489,46 @@ class TradingBot:
         self._cb_notified = False
         self.notifier.entry(fill["price"], fill["qty"], fill["cost"], stop0, 0.0, f"{sym}: {reason}")
         return fill["cost"]
+
+    def _trim_to_cap(self, snap: dict[str, dict]) -> None:
+        """Trim any held rotation position whose mark-to-market value exceeds
+        cap_mult x (equity / top_k) back down to that cap. A partial market sell
+        (booked via reduce_position so PnL is conserved into the final close); the
+        resting exchange stop is re-placed for the reduced qty. Never trims a name
+        into sub-min-notional dust. Bounds single-name concentration in the
+        whole-position book (validated to lift return + cut drawdown vs uncapped)."""
+        prices = {_base_of(sym): s["price"] for sym, s in snap.items()}
+        equity = self.risk.current_equity(self.data.fetch_balances(), prices)
+        cap_val = self.rotation.cap_mult * (equity / max(self.rotation.top_k, 1))
+        min_notional = self.cfg["risk"]["min_notional_usd"]
+        place_stop = self.cfg["runtime"]["place_orders"] and self.use_exchange_stop
+        for pos in self.risk.open_positions():
+            sym = pos["symbol"]
+            s = snap.get(sym)
+            if s is None or s["price"] <= 0:
+                continue
+            value = pos["qty"] * s["price"]
+            if value <= cap_val * 1.02:                # tolerance: don't churn on tiny excess
+                continue
+            trim_qty = (value - cap_val) / s["price"]
+            if trim_qty <= 0 or (pos["qty"] - trim_qty) * s["price"] < min_notional:
+                continue                               # never trim into dust
+            if place_stop:
+                self.executor.cancel(sym, pos["stop_order_id"])
+            fill = self.executor.market_sell(sym, trim_qty, s["price"], "concentration cap trim")
+            if fill is None:
+                continue
+            realized = self.risk.reduce_position(pos, fill, int(pos["tranches_done"] or 0),
+                                                 "concentration cap trim")
+            if place_stop:
+                pos2 = self.risk.open_position(sym)
+                if pos2 is not None:
+                    stop = pos2["current_stop"] or pos2["stop_price"]
+                    sid = self.executor.place_stop_limit_sell(
+                        sym, pos2["qty"], stop, self.risk.stop_limit_price(stop))
+                    self.risk.update_trail(pos2["id"], pos2["peak_price"], stop, sid)
+            logger.info("{} concentration cap trim: -{:.6f} (cap ${:.2f}/name)", sym, trim_qty, cap_val)
+            self.notifier.exit(fill["price"], realized, f"{sym}: concentration cap trim")
 
     # ------------------------------------------------------------------ #
     def _manage(self, sym: str, price: float, atr: float, balances: dict[str, float]) -> None:

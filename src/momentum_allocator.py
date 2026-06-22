@@ -27,6 +27,11 @@ class MomentumRotation:
         self.rebalance_days = int(a.get("rebalance_days", 2))
         self.lookback_days = int(a.get("lookback_days", 90))
         self.keep_band = int(a.get("keep_band", 0))
+        # Concentration cap: trim a held name above cap_mult x (equity/top_k) back to
+        # the cap each rebalance (None = off; winners run unbounded). Bounds single-
+        # name tail risk in the whole-position live book; validated in research.
+        cap = a.get("concentration_cap_mult", None)
+        self.cap_mult = float(cap) if cap is not None else None
         self.primary_tf = cfg["market"]["primary_timeframe"]
 
         # --- Composite scoring (opt-in; default preserves the simple ROC) --------

@@ -249,7 +249,8 @@ def momentum_topk(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
                   rebalance_every: int = 1, keep_band: int = 0,
                   rank_mode: str = "mom", roc_short: int = 20,
                   comp_weights: dict[str, float] | None = None,
-                  btc_base: str = "BTC") -> tuple[Run, Run, np.ndarray]:
+                  btc_base: str = "BTC",
+                  reweight: bool = True, cap_mult: float | None = None) -> tuple[Run, Run, np.ndarray]:
     """
     Cross-sectional momentum, daily-rebalanced by default but with two turnover
     controls so it isn't a churn mirage:
@@ -370,19 +371,43 @@ def momentum_topk(frames: dict[str, pd.DataFrame], entry: int, atr_mult: float,
                     sell_all(j, price, i)
             if target_set:
                 slot = tot / topk                # equal-weight; cash left if < K names
-                for j in target_set:             # trim first to free cash
-                    d = slot - units[j] * price[j]
-                    if d < -tot * 1e-6:
-                        qty = min((-d) / price[j], units[j])
-                        proceeds = qty * price[j] * (1 - slip); f = proceeds * fee
-                        cash += proceeds - f; units[j] -= qty; fees[i] += f; sw[i] += 1
-                for j in target_set:             # then top up
-                    d = slot - units[j] * price[j]
-                    if d > tot * 1e-6 and cash > 0:
-                        spend = min(d, cash); f = spend * fee
-                        units[j] += (spend - f) / (price[j] * (1 + slip))
-                        cash -= spend; fees[i] += f; sw[i] += 1
-                held = set(target_set)
+                if reweight:
+                    # REBALANCED (the validated backtest): trim/top-up EVERY target
+                    # name to the equal slot each rebalance.
+                    for j in target_set:             # trim first to free cash
+                        d = slot - units[j] * price[j]
+                        if d < -tot * 1e-6:
+                            qty = min((-d) / price[j], units[j])
+                            proceeds = qty * price[j] * (1 - slip); f = proceeds * fee
+                            cash += proceeds - f; units[j] -= qty; fees[i] += f; sw[i] += 1
+                    for j in target_set:             # then top up
+                        d = slot - units[j] * price[j]
+                        if d > tot * 1e-6 and cash > 0:
+                            spend = min(d, cash); f = spend * fee
+                            units[j] += (spend - f) / (price[j] * (1 + slip))
+                            cash -= spend; fees[i] += f; sw[i] += 1
+                    held = set(target_set)
+                else:
+                    # WHOLE-POSITION (what live main_loop._rotate actually does): held
+                    # winners RUN untouched; only NEW target names are funded, from
+                    # cash, strongest-first (so a low-cash book under-fills exactly as
+                    # live does). Optional cap_mult trims any name above cap_mult*slot
+                    # to bound single-name concentration while still letting it run.
+                    if cap_mult is not None:
+                        cap_val = cap_mult * slot
+                        for j in list(held):
+                            over = units[j] * price[j] - cap_val
+                            if over > tot * 1e-6 and price[j] > 0:
+                                qty = min(over / price[j], units[j])
+                                proceeds = qty * price[j] * (1 - slip); f = proceeds * fee
+                                cash += proceeds - f; units[j] -= qty; fees[i] += f; sw[i] += 1
+                    for j in cand:                   # strongest-first new entries
+                        if j in target_set and j not in held and price[j] > 0 and cash > tot * 1e-6:
+                            spend = min(slot, cash); f = spend * fee
+                            units[j] += (spend - f) / (price[j] * (1 + slip))
+                            cash -= spend; fees[i] += f; sw[i] += 1
+                            held.add(j)
+                    held = {j for j in range(J) if units[j] > 0}
 
         eq[i] = cash + float(np.sum(units * price))
         expo[i] = float(np.sum(units * price)) / eq[i] if eq[i] > 0 else 0.0
@@ -408,6 +433,8 @@ def main() -> None:
     ap.add_argument("--mom-lookback", type=int, default=90)
     ap.add_argument("--rebalance-every", type=int, default=7, help="rotate every N days (C2)")
     ap.add_argument("--keep-band", type=int, default=2, help="hysteresis ranks for C2")
+    ap.add_argument("--cap-mult", type=float, default=1.5,
+                    help="whole-position concentration cap (trim a name above cap_mult/K)")
     # Stressed cost regime (small-account taker on alts: wider spreads, more slip).
     ap.add_argument("--stress-fee", type=float, default=0.003)
     ap.add_argument("--stress-slip", type=float, default=0.004)
@@ -502,18 +529,31 @@ def main() -> None:
                                        rebalance_every=1, keep_band=0)
         C2, _, _ = momentum_topk(frames, entry, atr_mult, regime_on, capital, fee, slip,
                                  args.topk, args.mom_lookback,
-                                 f"C2 momentum ({args.rebalance_every}d+band)",
+                                 f"C2 rebal ({args.rebalance_every}d+band)",
                                  rebalance_every=args.rebalance_every, keep_band=args.keep_band)
+        # C2 whole-position = what live main_loop._rotate ACTUALLY does (held winners
+        # run, never trimmed) - judge the LIVE momentum behaviour on THIS row.
+        C2WP, _, _ = momentum_topk(frames, entry, atr_mult, regime_on, capital, fee, slip,
+                                   args.topk, args.mom_lookback,
+                                   f"C2 whole-pos (LIVE)",
+                                   rebalance_every=args.rebalance_every, keep_band=args.keep_band,
+                                   reweight=False)
+        # C2 whole-position + concentration cap (let winners run up to cap_mult/K).
+        C2WPC, _, _ = momentum_topk(frames, entry, atr_mult, regime_on, capital, fee, slip,
+                                    args.topk, args.mom_lookback,
+                                    f"C2 wp+cap{args.cap_mult:g}",
+                                    rebalance_every=args.rebalance_every, keep_band=args.keep_band,
+                                    reweight=False, cap_mult=args.cap_mult)
         # D: composite ranker (breakout+ROC+rel-strength+inv-vol) vs plain momentum.
         C3, _, _ = momentum_topk(frames, entry, atr_mult, regime_on, capital, fee, slip,
                                  args.topk, args.mom_lookback,
                                  f"C3 composite ({args.rebalance_every}d+band)",
                                  rebalance_every=args.rebalance_every, keep_band=args.keep_band,
                                  rank_mode="composite", roc_short=roc_short, comp_weights=comp_weights)
-        return A, A_bh, B, B2, B3, C1, C2, C3, cts
+        return A, A_bh, B, B2, B3, C1, C2, C2WP, C2WPC, C3, cts
 
     def cost_section(title: str, fee: float, slip: float) -> list[str]:
-        A, A_bh, B, B2, B3, C1, C2, C3, cts = build(fee, slip)
+        A, A_bh, B, B2, B3, C1, C2, C2WP, C2WPC, C3, cts = build(fee, slip)
         out = ["", "#" * 100, f"  {title}  (fee {fee:.2%}/side, slip {slip:.2%})", "#" * 100]
         for wname, mask_of in (("OUT-OF-SAMPLE (judge here)", lambda ts: ts > split),
                                ("FULL PERIOD", lambda ts: np.ones(len(ts), bool))):
@@ -525,6 +565,8 @@ def main() -> None:
             out.append(_row(B3.name, metrics(B3, mask_of(_eq_ts), A_bh.equity)))
             out.append(_row(C1.name, metrics(C1, mask_of(cts), A_bh.equity)))
             out.append(_row(C2.name, metrics(C2, mask_of(cts), A_bh.equity)))
+            out.append(_row(C2WP.name, metrics(C2WP, mask_of(cts), A_bh.equity)))
+            out.append(_row(C2WPC.name, metrics(C2WPC, mask_of(cts), A_bh.equity)))
             out.append(_row(C3.name, metrics(C3, mask_of(cts), A_bh.equity)))
             out.append("=" * 100)
         return out
