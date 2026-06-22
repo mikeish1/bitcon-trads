@@ -63,6 +63,27 @@ portfolio:
 - **Override at runtime** without editing the file via the `SYMBOLS` env var, e.g.
   `SYMBOLS=BTC,ETH,SOL`.
 
+### Deployable-capital limit — the master cap
+How much capital the bot may have **committed at once** is a single, centralized,
+user-adjustable parameter — a fixed USD amount, a percentage of equity/cash, or
+both (the safer one wins). It caps the *total envelope only*; it does **not**
+change how capital is allocated to the best opportunities inside that envelope.
+```yaml
+capital_policy:
+  spot:
+    max_pct: 0.90        # <= 90% of equity (the legacy default)
+    # max_usd: 1000.0    # also cap deployed capital at $1,000 (binds via `min`)
+    basis: "equity"      # equity | cash
+    precedence: "min"    # when both caps set: min | max | usd | pct
+```
+- **Flip it fast / persist across restarts** with env vars, e.g.
+  `MAX_DEPLOYED_CAPITAL_USD=1000` or `MAX_DEPLOYED_CAPITAL_PCT=0.5`.
+- **Change it live** (no restart): the settings service writes
+  `config/capital_limits.json`, which the running bot hot-reloads; every change is
+  audited. A future frontend can drive it via the optional REST API.
+- Defaults reproduce the **previous behavior exactly** — nothing changes until you
+  opt in. Full reference: **[docs/CAPITAL_LIMITS.md](docs/CAPITAL_LIMITS.md)**.
+
 ### Allocation mode — how capital is spread across the universe
 The Donchian breakout decides *when* each coin is in a trend; the **allocation
 mode** decides *which* trending coins actually get your capital. Two modes:

@@ -98,6 +98,55 @@ def load_config() -> dict[str, Any]:
     if alloc_env:
         cfg["strategy"]["allocation"]["mode"] = alloc_env.strip().lower()
 
+    # --- Enhancement toggles: present-by-default sections + "flip-it-fast" env vars.
+    # Every new feature is OFF by default, so these setdefaults keep behaviour
+    # identical for existing configs while letting env vars flip features without
+    # editing YAML (mirrors ALLOCATION_MODE above).
+    cfg["strategy"].setdefault("regime", {"enabled": False})
+    cfg["strategy"].setdefault("profit_taking", {"enabled": False})
+    cfg["risk"].setdefault("risk_budget", {"enabled": False})
+    if os.getenv("REGIME_ENABLED") is not None:
+        cfg["strategy"]["regime"]["enabled"] = _env_bool("REGIME_ENABLED", False)
+    if os.getenv("REGIME_METHOD"):
+        cfg["strategy"]["regime"]["method"] = os.getenv("REGIME_METHOD").strip().lower()
+    if os.getenv("PROFIT_TAKING_ENABLED") is not None:
+        cfg["strategy"]["profit_taking"]["enabled"] = _env_bool("PROFIT_TAKING_ENABLED", False)
+    if os.getenv("RISK_BUDGET_ENABLED") is not None:
+        cfg["risk"]["risk_budget"]["enabled"] = _env_bool("RISK_BUDGET_ENABLED", False)
+    mom_scoring = os.getenv("MOMENTUM_SCORING")
+    if mom_scoring:
+        cfg["strategy"]["allocation"].setdefault("momentum_rotation", {})
+        cfg["strategy"]["allocation"]["momentum_rotation"]["scoring"] = mom_scoring.strip().lower()
+
+    # --- Sleeve overlay + universe-expansion sections (present-by-default, off). --
+    cfg.setdefault("portfolio", {})
+    cfg["portfolio"].setdefault("sleeves", {"enabled": False})
+    cfg.setdefault("liquidity_filters", {})
+    cfg["universe"].setdefault("expansion", {"enabled": False, "candidates": [],
+                                             "approved_expanded_universe": []})
+    if os.getenv("SLEEVES_ENABLED") is not None:
+        cfg["portfolio"]["sleeves"]["enabled"] = _env_bool("SLEEVES_ENABLED", False)
+    sleeve_mode = os.getenv("SLEEVE_ALLOCATOR_MODE")
+    if sleeve_mode:
+        cfg["portfolio"]["sleeves"]["allocator_mode"] = sleeve_mode.strip().lower()
+
+    # --- Execution-quality knobs: backward-compatible defaults + fast env flips. --
+    ex = cfg.setdefault("execution", {})
+    ex.setdefault("use_limit_orders_on_entry", False)   # market orders if YAML predates this
+    ex.setdefault("slippage_logging_enabled", True)
+    ex.setdefault("cost_preference_mode", "off")
+    if os.getenv("USE_LIMIT_ORDERS") is not None:
+        ex["use_limit_orders_on_entry"] = _env_bool("USE_LIMIT_ORDERS", False)
+    if os.getenv("SLIPPAGE_LOGGING") is not None:
+        ex["slippage_logging_enabled"] = _env_bool("SLIPPAGE_LOGGING", True)
+    if os.getenv("COST_PREFERENCE_MODE"):
+        ex["cost_preference_mode"] = os.getenv("COST_PREFERENCE_MODE").strip().lower()
+
+    # --- Trading-ops agent (analysis + gated proposals; off by default). ---------
+    cfg.setdefault("ops_agent", {"enabled": False})
+    if os.getenv("OPS_AGENT_ENABLED") is not None:
+        cfg["ops_agent"]["enabled"] = _env_bool("OPS_AGENT_ENABLED", False)
+
     cfg["runtime"] = {
         "paper_trading": paper,
         "live_trading_enabled": live_enabled,

@@ -1,0 +1,113 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Professional dark trading palette (WCAG-AA verified pairings).
+ * base #0B0E11 · surface #151A21 · pos emerald · neg rose · warn amber · regime cyan
+ * A light theme is provided for completeness; the app defaults to dark.
+ */
+@layer base {
+  :root {
+    --background: 220 26% 5%;          /* #0B0E11 */
+    --foreground: 210 16% 90%;         /* #E6E8EB */
+    --card: 216 20% 11%;               /* #151A21 */
+    --card-foreground: 210 16% 90%;
+    --popover: 216 22% 9%;
+    --popover-foreground: 210 16% 90%;
+    --primary: 199 89% 56%;            /* cyan/blue accent */
+    --primary-foreground: 220 26% 6%;
+    --secondary: 216 16% 18%;
+    --secondary-foreground: 210 16% 90%;
+    --muted: 216 16% 16%;
+    --muted-foreground: 215 12% 60%;   /* #8A93A2 */
+    --accent: 216 16% 20%;
+    --accent-foreground: 210 16% 92%;
+    --destructive: 351 80% 58%;        /* #EA3943 */
+    --destructive-foreground: 0 0% 100%;
+    --border: 216 14% 20%;
+    --input: 216 14% 22%;
+    --ring: 199 89% 56%;
+    --radius: 0.625rem;
+
+    --pos: 152 76% 44%;                /* #16C784 emerald */
+    --pos-foreground: 152 60% 12%;
+    --neg: 351 80% 58%;                /* rose/red */
+    --neg-foreground: 0 0% 100%;
+    --warn: 45 93% 50%;                /* #F0B90B amber */
+    --warn-foreground: 45 80% 10%;
+    --regime: 187 92% 45%;             /* cyan regime-on */
+    --regime-foreground: 187 80% 10%;
+  }
+
+  .light {
+    --background: 210 20% 98%;
+    --foreground: 220 26% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 26% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 26% 12%;
+    --primary: 199 89% 44%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 16% 92%;
+    --secondary-foreground: 220 26% 12%;
+    --muted: 210 16% 94%;
+    --muted-foreground: 215 14% 38%;
+    --accent: 210 16% 90%;
+    --accent-foreground: 220 26% 12%;
+    --destructive: 351 75% 48%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 18% 86%;
+    --input: 214 18% 84%;
+    --ring: 199 89% 44%;
+    --pos: 152 65% 36%;
+    --neg: 351 75% 48%;
+    --warn: 38 92% 42%;
+    --regime: 187 80% 38%;
+  }
+
+  * {
+    @apply border-border;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "tnum" 1, "cv11" 1;
+  }
+  /* Tabular numerals for all numeric/monospace cells (aligned columns). */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Always-visible, high-contrast focus ring for keyboard users. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 9999px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

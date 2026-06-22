@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from src.settings_service import CapitalSettingsService
 from .types import PairFill
 
 _YEAR_SECONDS = 365.0 * 24.0 * 3600.0
@@ -35,6 +36,11 @@ class CarryRiskManager:
         c = cfg["carry"]
         self.assets: list[str] = list(c["assets"])
         self.sleeve = float(c["capital"]["sleeve_usd"])
+        # Centralized deployable-capital envelope for the carry sleeve. Defaults to
+        # the fixed USD sleeve; the user can tighten it (smaller USD cap, or a % of
+        # the sleeve) via YAML / the settings service. The sleeve doubles as the
+        # "equity"/"cash" basis here since a delta-neutral carry tracks no equity.
+        self.capital_policy = CapitalSettingsService(cfg).policy("carry")
         self.per_asset_cap = float(c["capital"]["per_asset_cap_usd"])
         self.min_notional = float(c["capital"]["min_notional_usd"])
         self.target_leverage = max(float(c["risk"]["target_leverage"]), 0.01)
@@ -137,7 +143,8 @@ class CarryRiskManager:
             return False, f"already holding {asset}"
         if self._day_realized() <= -self.daily_loss_limit:
             return False, f"daily loss limit (${self._day_realized():.2f})"
-        if self.capital_used() >= self.sleeve:
+        deployable = float(self.capital_policy.deployable_capital(self.sleeve, self.sleeve))
+        if self.capital_used() >= deployable:
             return False, "sleeve fully deployed"
         return True, "ok"
 
@@ -146,7 +153,8 @@ class CarryRiskManager:
         if spot_price <= 0:
             return {"notional": 0.0, "qty": 0.0, "capital": 0.0, "viable": False}
         capital_mult = 1.0 + 1.0 / self.target_leverage
-        remaining = max(0.0, self.sleeve - self.capital_used())
+        remaining = float(self.capital_policy.remaining_capacity(
+            self.sleeve, self.sleeve, self.capital_used()))
         notional = min(self.per_asset_cap, remaining / capital_mult)
         capital = notional * capital_mult
         return {
