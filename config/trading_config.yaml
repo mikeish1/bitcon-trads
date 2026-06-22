@@ -81,7 +81,12 @@ portfolio:
   sleeves:
     enabled: false                  # true -> log daily target weights in the spot loop
     members: [donchian, carry, etf]
-    allocator_mode: "risk_parity"   # "risk_parity" (inverse-vol) | "momentum_of_strategies"
+    # "equal_weight" = static 1/N, the VALIDATED winner on the combined book
+    #   (Calmar 0.95 vs risk_parity 0.88 / momentum 0.91; src/portfolio_sleeve_research.py).
+    #   The uncorrelated low-vol carry sleeve does the diversifying; the "clever"
+    #   allocators give up Calmar trying to time the sleeves. Prefer this.
+    # "risk_parity" = inverse-vol | "momentum_of_strategies" = tilt to recent winners.
+    allocator_mode: "equal_weight"  # equal_weight | risk_parity | momentum_of_strategies
     lookback_days: 60               # window for sleeve return/vol/Sharpe
     min_weight: 0.15                # per-sleeve floor (sum-to-1 after clamping)
     max_weight: 0.60                # per-sleeve ceiling
