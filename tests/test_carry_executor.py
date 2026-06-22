@@ -45,9 +45,62 @@ class _Fake:
                 "cost": qty * (price or 100.0), "fee": {"cost": 0.0}}
 
 
+class _PartialFake:
+    """Perp stub whose FIRST sell fills only `fill_ratio` of the request (a partial
+    short fill); later orders fill in full. Optionally fails the corrective top-up."""
+    def __init__(self, fill_ratio: float = 0.7, fail_topup: bool = False):
+        self.fill_ratio = fill_ratio
+        self.fail_topup = fail_topup
+        self.calls: list[tuple] = []
+        self._sells = 0
+
+    def amount_to_precision(self, symbol, qty):
+        return qty
+
+    def create_order(self, symbol, type_, side, qty, price=None, params=None):
+        self.calls.append((side, qty))
+        px = price or 100.0
+        if side == "sell":
+            self._sells += 1
+            if self._sells == 1:                      # the initial short: partial fill
+                filled = qty * self.fill_ratio
+                return {"id": "sell-1", "filled": filled, "average": px,
+                        "cost": filled * px, "fee": {"cost": 0.0}}
+            if self.fail_topup:                       # the corrective top-up fails
+                raise RuntimeError("simulated top-up failure")
+        return {"id": f"{side}", "filled": qty, "average": px, "cost": qty * px,
+                "fee": {"cost": 0.0}}
+
+
 def _live_cfg():
     cfg = base_cfg(mode="live", place=True, real=True)
     return cfg
+
+
+def test_live_open_tops_up_a_partial_short():
+    # The short fills only 70%, leaving the pair net long. The executor must top the
+    # short up to match the owned spot so the returned pair is delta-neutral.
+    spot, perp = _Fake(), _PartialFake(fill_ratio=0.7)
+    ex = CarryExecutor(_live_cfg(), spot=spot, perp=perp)
+    pair = ex.open_pair("BTC", "BTC/USD", "BTC/USD:USD", notional=400.0,
+                        spot_price=100.0, perp_price=100.0)
+    assert pair is not None
+    assert pair.perp.qty == pytest.approx(pair.spot.qty, rel=1e-9)   # neutral again
+    assert pair.perp.fee >= 0.0
+    sells = [c for c in perp.calls if c[0] == "sell"]
+    assert len(sells) == 2                                           # initial + top-up
+
+
+def test_live_open_rolls_back_when_rehedge_fails():
+    # Partial short, and the corrective top-up fails -> roll the whole position to
+    # flat (sell the spot, cover the partial short) rather than hold an unhedged book.
+    spot, perp = _Fake(), _PartialFake(fill_ratio=0.7, fail_topup=True)
+    ex = CarryExecutor(_live_cfg(), spot=spot, perp=perp)
+    pair = ex.open_pair("BTC", "BTC/USD", "BTC/USD:USD", notional=400.0,
+                        spot_price=100.0, perp_price=100.0)
+    assert pair is None
+    assert [c[0] for c in spot.calls] == ["buy", "sell"]            # spot rolled back
+    assert ("buy", pytest.approx(2.8)) in [(c[0], c[1]) for c in perp.calls]  # cover partial
 
 
 def test_live_open_rolls_back_spot_when_short_fails():

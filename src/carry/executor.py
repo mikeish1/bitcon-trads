@@ -40,6 +40,9 @@ class CarryExecutor:
         ex = cfg["carry"]["execution"]
         self.fee_pct = float(ex["taker_fee_pct"])
         self.slip = float(ex["paper_slippage_pct"])
+        # A partial fill must not leave a "delta-neutral" pair directionally exposed:
+        # the short is corrected back toward the owned spot when it drifts past this.
+        self.delta_tol = float((cfg["carry"].get("risk", {}) or {}).get("delta_tolerance_pct", 0.03))
         self.tag = "[CARRY-LIVE]" if self.real_money else "[CARRY-SIM]"
         self._seq = 0
 
@@ -120,7 +123,84 @@ class CarryExecutor:
                     f"{asset}: short failed AND spot rollback failed - NAKED LONG {spot_fill.qty}. "
                     f"Manual intervention required. ({exc2})") from exc2
             return None
+        # Delta top-up: a partial fill on either leg leaves directional risk in a
+        # "delta-neutral" pair. Correct the short to the owned spot before returning,
+        # so the pair is genuinely neutral (not merely alerted-on a poll later).
+        perp_fill = self._balance_short_to_spot(asset, spot_symbol, perp_symbol,
+                                                spot_fill, perp_fill, spot_price, perp_price)
+        if perp_fill is None:
+            return None      # neutrality unattainable -> rolled back to flat inside.
         return PairFill(asset, spot_fill, perp_fill, notional)
+
+    # ------------------------------------------------------------------ #
+    # Delta-neutrality maintenance (partial-fill rehedge)                #
+    # ------------------------------------------------------------------ #
+    def _balance_short_to_spot(self, asset: str, spot_symbol: str, perp_symbol: str,
+                               spot_fill: Fill, perp_fill: Fill, spot_price: float,
+                               perp_price: float) -> Optional[Fill]:
+        """Ensure the short quantity matches the owned spot after fills. If the legs
+        drifted past `delta_tol` (a partial fill), top up the short (sell more) or
+        trim it (buy back, reduce-only) to the spot quantity and return the merged
+        perp Fill. If the corrective order fails, roll the whole position back to
+        flat and return None - never hold an unhedged book. No-op within tolerance."""
+        target, have = spot_fill.qty, perp_fill.qty
+        ref = max(target, have, 1e-12)
+        if target <= 0 or abs(target - have) / ref <= self.delta_tol:
+            return perp_fill                       # already neutral within tolerance
+        diff = target - have
+        side = "sell" if diff > 0 else "buy"       # sell = short more; buy = reduce over-short
+        try:
+            adj = self._live_market(self.perp, "perp", side, perp_symbol, abs(diff),
+                                    perp_price, reduce_only=(side == "buy"))
+        except Exception as exc:
+            logger.critical("{} {} delta rehedge FAILED (short {:.6f} vs spot {:.6f}) - "
+                            "rolling back to flat: {}", self.tag, asset, have, target, exc)
+            self._rollback_pair(asset, spot_symbol, perp_symbol, spot_fill.qty, have,
+                                spot_price, perp_price)
+            return None
+        merged = self._merge_short(perp_fill, adj, side)
+        logger.warning("{} {} delta rehedge: {} {:.6f} perp -> short {:.6f} matches spot {:.6f}.",
+                       self.tag, asset, side, abs(diff), merged.qty, target)
+        return merged
+
+    @staticmethod
+    def _merge_short(base: Fill, adj: Fill, side: str) -> Fill:
+        """Fold a corrective perp order into the original short fill. A 'sell' adds to
+        the short (notional-weighted avg entry); a 'buy' reduces it (the remaining
+        short keeps its entry price). Fees always accumulate."""
+        if side == "sell":                         # added to the short
+            qty = base.qty + adj.qty
+            notional = base.notional + adj.notional
+            price = (notional / qty) if qty else base.price
+        else:                                      # bought back part of the short
+            qty = max(base.qty - adj.qty, 0.0)
+            price = base.price
+            notional = qty * price
+        return Fill(leg="perp", side="sell", qty=qty, price=price, notional=notional,
+                    fee=base.fee + adj.fee, order_id=base.order_id)
+
+    def _rollback_pair(self, asset: str, spot_symbol: str, perp_symbol: str, spot_qty: float,
+                       perp_qty: float, spot_price: float, perp_price: float) -> None:
+        """Best-effort unwind to flat after a failed rehedge: cover the partial short,
+        then sell the spot. Escalates to CarryExecutionError if a leg cannot be closed
+        (genuinely stuck - fail loud for operator intervention rather than leave an
+        unbalanced/naked book)."""
+        errs: list[str] = []
+        if perp_qty > 0:
+            try:
+                self._live_market(self.perp, "perp", "buy", perp_symbol, perp_qty,
+                                  perp_price, reduce_only=True)
+            except Exception as exc:
+                errs.append(f"perp cover {perp_qty}: {exc}")
+        try:
+            self._live_market(self.spot, "spot", "sell", spot_symbol, spot_qty, spot_price)
+        except Exception as exc:
+            errs.append(f"spot sell {spot_qty}: {exc}")
+        if errs:
+            raise CarryExecutionError(
+                f"{asset}: rehedge rollback failed - position may be unbalanced/naked, "
+                f"manual intervention required. ({'; '.join(errs)})")
+        logger.warning("{} {} rolled back to flat after a rehedge failure.", self.tag, asset)
 
     # --- single-leg closes (the loop drives these for a resumable unwind) ----- #
     def cover_perp(self, asset: str, perp_symbol: str, qty: float,
