@@ -1,0 +1,71 @@
+{
+  "handoff": {
+    "step_id": "stage-3-strategy-risk-impl",
+    "status": "success",
+    "confidence": 0.84,
+    "key_outputs": {
+      "dual_momentum_selector": "src/etf/dual_momentum.py - pure; reuses MomentumRotation (momentum/clock/top-K/hysteresis) verbatim, adds the abs-filter + offensive/defensive regime split; same interface as EtfMomentumSelector",
+      "mode_switch": "etf.selection.mode rotation|dual_momentum via build_selector factory; loop + backtester mode-agnostic; default rotation (opt-in, reversible)",
+      "universe_union": "dual_momentum mode -> tradable universe = offensive + defensive (config_etf), unless ETF_UNIVERSE set",
+      "R3_parity": "tests/test_etf_stage3.py pins closed-candle live view == backtester point-in-time slice across a rotating window (golden-master vs dual-codepath drift)",
+      "R8_reconcile": "split/qty-drift now FLAGGED (alert) not closed; basis never auto-rewritten; position-gone still auto-closes; reconcile returns notes -> Telegram",
+      "R10_pdt_guard": "opened_today() + loop guard never round-trips a symbol same day (etf.pdt_guard, default on)",
+      "regime_alerts": "loop alerts + logs on risk-on/off flips (dual_momentum)",
+      "tests": "246 passed (+7 dual-momentum selector, +6 Stage-3 integration)"
+    },
+    "self_review": {
+      "correctness": "logic + edge cases tested (risk-on/off, abs hurdle incl 0.0 fallback, top_k, short-history, drift, same-day); parity test pins live==backtest",
+      "design": "one pure selector + factory + minimal loop/risk wiring; single-responsibility; maximal reuse of MomentumRotation",
+      "safety": "two-key tripwire untouched; fail-closed clock + no-phantom-fill preserved; reconcile never auto-misstates basis; no secrets; least privilege",
+      "simplicity": "few parameters; correlation cap deferred with rationale (ADR-006); chandelier stop deferred to a v2/Stage-4 decision",
+      "overall_quality": "Good",
+      "blocking_issues": "none",
+      "non_blocking": ["daily chandelier stop (optional v2)", "correlation cap if top_k raised", "gap-at-open belongs to Stage 4"]
+    },
+    "assumptions": [
+      "dual_momentum default config: offensive {SPY,EFA,EEM}, defensive {TLT,IEF,GLD,BIL}, BIL hurdle, 252d lookback, top_k 1, ~monthly",
+      "paper-only intent -> flag-only reconcile acceptable",
+      "default selection.mode stays rotation until Stage-4 validates dual_momentum"
+    ],
+    "open_issues": [
+      "ETF backtester still zero-cost / no IS-OOS / no benchmarks (Stage 4 builds the real harness)",
+      "gap-at-open fill modeling (R6) -> Stage 4",
+      "changes committed? pending; this is a MANDATORY human checkpoint on risk/sizing/exec code"
+    ],
+    "artifacts": [
+      "src/etf/dual_momentum.py",
+      "src/etf/selector.py",
+      "src/etf/config_etf.py",
+      "src/etf/main.py",
+      "src/etf/risk.py",
+      "src/etf/backtester.py",
+      "config/trading_config.yaml",
+      "tests/test_etf_dual_momentum.py",
+      "tests/test_etf_stage3.py",
+      "docs/equities_replatform/adr.md",
+      "docs/equities_replatform/decisions/stage-3.json"
+    ],
+    "verification_passed": true,
+    "next_focus": "Stage 4: realistic cost+slippage+gap-at-open harness; walk-forward IS/OOS; regimes (2008/2020/2022/chop); Monte-Carlo; param sensitivity; metrics vs control-A, SPY, 60/40; after-tax."
+  },
+  "judge": {
+    "overall_score": 8.7,
+    "decision": "pass",
+    "dimensions": {
+      "correctness": {"score": 9, "reasoning": "Selector logic + reconcile + PDT guard unit-tested across happy/edge/error paths; R3 parity test empirically found and fixed a real test bug (per-symbol closed_view) and now pins live==backtest; full suite 246 green."},
+      "design": {"score": 9, "reasoning": "New pure selector reuses MomentumRotation verbatim; mode factory keeps loop/backtester unchanged; single-responsibility modules; low coupling."},
+      "robustness": {"score": 8, "reasoning": "Few-parameter design; abs hurdle has a safe 0.0 fallback; insufficient-history path yields cash; reconcile never auto-misstates basis. Real OOS robustness still to be proven in Stage 4."},
+      "safety_compliance": {"score": 9, "reasoning": "Tripwire/fail-closed clock/no-phantom-fill preserved; PDT guard guarantees zero same-day round-trips; split-drift flagged not auto-applied; no secrets; default mode unchanged (opt-in)."},
+      "simplicity": {"score": 8, "reasoning": "Minimal new surface; correlation cap and chandelier stop deferred with explicit ADR rationale rather than speculatively added."},
+      "clarity": {"score": 9, "reasoning": "ADRs per decision, YAML documented, ETF_MOMENTUM updated, docstrings explain the why (esp. the defensive sleeve and flag-only reconcile)."}
+    },
+    "issues_found": [
+      "Dual-momentum profitability unproven until Stage 4 (by design)",
+      "ETF backtester still inadequate for go/no-go (Stage 4 scope)"
+    ],
+    "suggested_revisions": [
+      "Mandatory human review of the risk/sizing/execution changes (risk.py reconcile/opened_today, main.py loop) before Stage 4"
+    ],
+    "confidence_in_judgment": 0.82
+  }
+}

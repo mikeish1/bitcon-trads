@@ -46,6 +46,36 @@ def load_etf_config() -> dict[str, Any]:
     sel.setdefault("rebalance_days", 5)
     sel.setdefault("lookback_days", 90)
     sel.setdefault("keep_band", 1)
+    # Selector: "rotation" (Donchian-gated top-K, original) | "dual_momentum" (GEM).
+    sel["mode"] = os.getenv("ETF_SELECTION_MODE", sel.get("mode", "rotation")).strip().lower()
+
+    # --- Dual-momentum (Antonacci GEM-style) parameters (mode: dual_momentum) ----
+    # Absolute + relative momentum across an OFFENSIVE basket with a DEFENSIVE sleeve
+    # fallback. Few-parameter, low-turnover (tax-friendly). Off unless mode selects it.
+    # See docs/equities_replatform/strategy_options.md + data_bias_audit.md.
+    dm = e.setdefault("dual_momentum", {})
+    dm.setdefault("offensive", ["SPY", "EFA", "EEM"])
+    dm.setdefault("defensive", ["TLT", "IEF", "GLD", "BIL"])
+    dm.setdefault("abs_benchmark", "BIL")     # T-bill proxy = the absolute hurdle ("" -> 0.0)
+    dm.setdefault("lookback_days", 252)       # ~12-month momentum (abs + rel share it)
+    dm.setdefault("top_k", 1)                 # GEM classic = hold the single strongest
+    dm.setdefault("rebalance_days", 20)       # ~monthly cadence
+    dm.setdefault("keep_band", 0)             # rank hysteresis
+    dm.setdefault("min_history", 260)         # need >= lookback + buffer bars
+
+    # Pattern-Day-Trader guard: never round-trip a symbol the same day it was opened
+    # (the design holds multi-day/weekly, so this only blocks accidental same-day
+    # exits). Keeps a <$25k margin account clear of the 3-day-trades/5-day rule.
+    e["pdt_guard"] = _env_bool("ETF_PDT_GUARD", bool(e.get("pdt_guard", True)))
+
+    # In dual-momentum mode the tradable universe is the union of the offensive +
+    # defensive sleeves (unless ETF_UNIVERSE was set explicitly).
+    if sel["mode"] == "dual_momentum" and not uni_env:
+        seen: list[str] = []
+        for s in [*dm["offensive"], *dm["defensive"]]:
+            if s.upper() not in seen:
+                seen.append(s.upper())
+        e["universe"] = seen
 
     cap = e.setdefault("capital", {})
     cap["sleeve_usd"] = _env_float("ETF_SLEEVE_USD", cap.get("sleeve_usd", 2000.0))

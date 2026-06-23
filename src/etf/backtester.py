@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from .selector import EtfMomentumSelector
+from .selector import EtfMomentumSelector, build_selector
 
 
 def _close_on_or_before(df: pd.DataFrame, t: Any) -> Optional[float]:
@@ -100,7 +100,7 @@ def main() -> None:  # pragma: no cover - network CLI
     cfg = load_etf_config()
     if args.universe:
         cfg["etf"]["universe"] = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
-    selector = EtfMomentumSelector(cfg)
+    selector = build_selector(cfg)
     data = EtfData(cfg, build_broker(cfg))
     tf = cfg["etf"]["primary_timeframe"]
     panel: dict[str, pd.DataFrame] = {}
@@ -112,8 +112,13 @@ def main() -> None:  # pragma: no cover - network CLI
     if not panel:
         print("No data fetched.")
         return
-    stats = run_backtest(panel, selector, primary_tf=tf,
-                         start_after=cfg["etf"]["selection"]["min_history"])
+    # Warm-up must cover the selector's lookback (dual-momentum uses a ~12-month
+    # lookback, far longer than the rotation min_history).
+    if str(cfg["etf"]["selection"].get("mode", "rotation")) == "dual_momentum":
+        warmup = int(cfg["etf"]["dual_momentum"]["min_history"])
+    else:
+        warmup = int(cfg["etf"]["selection"]["min_history"])
+    stats = run_backtest(panel, selector, primary_tf=tf, start_after=warmup)
     print(f"\nETF momentum backtest ({len(panel)} symbols):")
     for k, v in stats.items():
         print(f"  {k:18s} {v}")

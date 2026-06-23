@@ -458,6 +458,8 @@ etf:
   enabled: false
   venue: "alpaca"                  # "alpaca" (alpaca-py: real US equities) | a ccxt id
   alpaca_feed: "iex"               # Alpaca data feed: "iex" (free) | "sip" (paid)
+  alpaca_adjustment: "all"         # split+dividend adjust bars (REQUIRED; "raw" reintroduces
+                                   # phantom split/ex-div gaps). Env: ETF_ALPACA_ADJUSTMENT.
   primary_timeframe: "1d"
   backfill_days: 400               # daily bars on startup (~1.6y; warms indicators)
   poll_seconds: 3600               # daily strategy; hourly poll is ample
@@ -468,6 +470,10 @@ etf:
   # Diversified, liquid ETFs across asset classes (equities/intl/bonds/gold/cmdty/RE).
   universe: [SPY, QQQ, IWM, EFA, EEM, TLT, IEF, GLD, DBC, VNQ]
   selection:
+    # Selector: "rotation" (Donchian-gated top-K, the original) | "dual_momentum"
+    # (Antonacci GEM-style abs+rel momentum + defensive sleeve - the design selected
+    # for a small TAXABLE account; see docs/equities_replatform/). Env: ETF_SELECTION_MODE.
+    mode: "rotation"
     entry_period: 40               # Donchian breakout window (the trend filter)
     atr_trail_mult: 3.0            # chandelier used by active_state (same as crypto)
     min_history: 60                # need this many daily bars before trading
@@ -475,6 +481,27 @@ etf:
     rebalance_days: 5              # rotate at most weekly
     lookback_days: 90              # momentum = close / close N days ago - 1
     keep_band: 1                   # rank hysteresis (keep until rank > top_k+band)
+
+  # --- Dual-momentum (only used when selection.mode == dual_momentum) ----------
+  # Hold the strongest OFFENSIVE asset(s) only while their absolute momentum beats a
+  # T-bill hurdle; otherwise rotate to the strongest DEFENSIVE asset (bonds/gold/
+  # T-bills cash floor). Few-parameter, low-turnover (tax-friendly). In this mode the
+  # tradable universe is the union of the offensive + defensive sleeves.
+  dual_momentum:
+    offensive:  [SPY, EFA, EEM]        # US / developed-intl / EM equity
+    defensive:  [TLT, IEF, GLD, BIL]   # Treasuries / gold / T-bills (cash floor)
+    abs_benchmark: "BIL"               # symbol whose momentum is the absolute hurdle ("" -> 0.0)
+    lookback_days: 252                 # ~12-month momentum (absolute + relative share it)
+    top_k: 1                           # GEM classic = hold the single strongest
+    rebalance_days: 20                 # ~monthly cadence
+    keep_band: 0                       # rank hysteresis
+    min_history: 260                   # need >= lookback + buffer bars before trading
+
+  # Pattern-Day-Trader guard: never round-trip a symbol the same day it opened (the
+  # design holds multi-day/weekly, so this only blocks accidental same-day exits).
+  # Keeps a <$25k margin account clear of the 3-day-trades/5-day rule.
+  pdt_guard: true
+
   capital:
     sleeve_usd: 2000.0             # paper sleeve (siloed from crypto equity)
     max_total_exposure_pct: 0.95   # cap total deployed across all ETFs

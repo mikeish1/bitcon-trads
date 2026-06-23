@@ -26,7 +26,7 @@ from .config_etf import load_etf_config
 from .data import EtfData
 from .executor import EtfExecutor
 from .risk import EtfRiskManager
-from .selector import EtfMomentumSelector
+from .selector import build_selector
 
 _MODE_LABEL = {"live": "LIVE (REAL MONEY)", "paper-broker": "PAPER-BROKER (Alpaca paper, no money)",
                "sim": "SIM (paper ledger, live data)"}
@@ -43,17 +43,19 @@ class EtfBot:
 
         self.broker = build_broker(self.cfg)
         self.data = EtfData(self.cfg, self.broker)
-        self.selector = EtfMomentumSelector(self.cfg)
+        self.selector = build_selector(self.cfg)
         self.risk = EtfRiskManager(self.cfg)
         self.executor = EtfExecutor(self.cfg, self.broker)
         self.notifier = Notifier(self.cfg)
+        self.sel_mode = str(self.cfg["etf"]["selection"].get("mode", "rotation"))
+        self.pdt_guard = bool(self.cfg["etf"].get("pdt_guard", True))
 
         self.running = True
         self._mode = _MODE_LABEL.get(self.rt["mode"], self.rt["mode"])
         logger.info("=" * 70)
-        logger.info("ETF Momentum Bot | venue={} | mode={} | top-{} of {} ETFs, rotate every {}d",
-                    self.rt["venue"], self._mode, self.selector.top_k, len(self.universe),
-                    self.cfg["etf"]["selection"]["rebalance_days"])
+        logger.info("ETF Bot | venue={} | mode={} | selector={} | top-{} of {} ETFs, rotate every {}d",
+                    self.rt["venue"], self._mode, self.sel_mode, self.selector.top_k,
+                    len(self.universe), self.selector.rotation.rebalance_days)
         logger.info("=" * 70)
         signal.signal(signal.SIGINT, self._sig)
         signal.signal(signal.SIGTERM, self._sig)
@@ -81,7 +83,8 @@ class EtfBot:
         # drift from the account. No-op in sim.
         if self.rt["place_orders"]:
             try:
-                self.risk.reconcile(self.broker.positions(), {})
+                for note in self.risk.reconcile(self.broker.positions(), {}):
+                    self.notifier.message(f"📈ETF reconcile: {note}")
             except Exception as exc:
                 logger.warning("ETF startup reconcile skipped: {}", exc)
 
@@ -108,6 +111,16 @@ class EtfBot:
         bal = {self.rt["quote"]: self.broker.cash()}
         bal.update(self.broker.positions())
         return bal
+
+    def _note_regime(self, regime: str | None) -> None:
+        """Alert + log on a risk-on/off flip (dual-momentum mode emits a regime)."""
+        if not regime:
+            return
+        prev = self.risk.state_get("etf_regime")
+        if prev != regime:
+            self.risk.state_set("etf_regime", regime)
+            logger.info("ETF regime flip: {} -> {}", prev or "?", regime)
+            self.notifier.message(f"📈ETF regime: {prev or '?'} -> {regime}")
 
     # ------------------------------------------------------------------ #
     def _cycle(self) -> None:
@@ -147,14 +160,20 @@ class EtfBot:
 
         held = self.risk.held_symbols()
         plan = self.selector.plan(frames_by_symbol, held)
+        self._note_regime(plan.get("regime"))
         if plan["exit"] or plan["enter"]:
-            logger.info("ETF rotation: hold {} | exit {} | enter {}",
-                        sorted(plan["target"]), plan["exit"], plan["enter"])
+            logger.info("ETF {}: hold {} | exit {} | enter {}",
+                        self.sel_mode, sorted(plan["target"]), plan["exit"], plan["enter"])
 
         # 1) Exits: sell symbols that fell out of the target set.
         for sym in plan["exit"]:
             pos = self.risk.open_position(sym)
             if pos is None or sym not in prices:
+                continue
+            # PDT guard: never round-trip a symbol the same calendar day it opened
+            # (keeps a <$25k margin account clear of the day-trade rule).
+            if self.pdt_guard and self.risk.opened_today(pos, today):
+                logger.info("{} exit deferred: opened today (PDT same-day guard).", sym)
                 continue
             fill = self.executor.market_sell(sym, pos["qty"], prices[sym], "rotation: out of top-K")
             if fill is None:

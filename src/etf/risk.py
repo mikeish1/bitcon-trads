@@ -20,6 +20,9 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_QTY_DRIFT_TOLERANCE = 0.02   # |broker-ledger|/ledger above this = flag (split / external change)
+
+
 class EtfRiskManager:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
@@ -156,21 +159,48 @@ class EtfRiskManager:
                     fill["price"], pnl, reason)
         return pnl
 
-    def reconcile(self, broker_positions: dict[str, float], prices: dict[str, float]) -> None:
-        """Close any OPEN DB position the broker no longer holds (external/manual close,
-        full liquidation, delisting). Broker mode only. Only the 'position gone' case is
-        handled - splits / partial external changes are left for a human, mirroring the
-        spot bot's reconcile - so we never misstate a cost basis automatically."""
+    def opened_today(self, position: sqlite3.Row, today_iso: str) -> bool:
+        """True if the position opened on the given calendar day (UTC). Drives the
+        loop's PDT same-day guard, which prevents a same-day round-trip."""
+        opened = position["opened_at"]
+        return bool(opened) and str(opened)[:10] == today_iso[:10]
+
+    def reconcile(self, broker_positions: dict[str, float],
+                  prices: dict[str, float]) -> list[str]:
+        """Reconcile the DB ledger against the broker (broker mode only). Returns a
+        list of human-readable anomaly notes for alerting.
+
+        Two cases handled:
+          * 'position gone' - the broker no longer holds a symbol our ledger marks
+            OPEN (external/manual close, full liquidation, delisting): close it.
+          * 'qty drift' - the broker still holds the symbol but a materially different
+            qty (a split or external partial change): FLAG only. We never auto-rewrite
+            a cost basis - a split changes qty + price but not cost, while an external
+            sale changes cost, and we cannot tell which apart - mirroring the spot
+            bot's "leave it to a human" reconcile. A human resolves it.
+        """
         if not self.uses_broker:
-            return
+            return []
+        notes: list[str] = []
         for pos in self.open_positions():
             sym = pos["symbol"]
             price = prices.get(sym, pos["entry_price"])
             dust = self.min_notional / price if price else 0.0
-            if broker_positions.get(sym, 0.0) < dust and pos["qty"] > dust:
+            broker_qty = broker_positions.get(sym, 0.0)
+            if broker_qty < dust and pos["qty"] > dust:
                 logger.warning("ETF reconcile: {} not held at broker - closing (external fill).", sym)
                 self.record_close(pos, {"price": price, "qty": pos["qty"], "fee": 0.0},
                                   "reconcile: not held at broker")
+                notes.append(f"{sym} closed (not held at broker)")
+            elif broker_qty > dust and pos["qty"] > dust:
+                drift = abs(broker_qty - pos["qty"]) / pos["qty"]
+                if drift > _QTY_DRIFT_TOLERANCE:
+                    logger.warning(
+                        "ETF reconcile: {} qty drift ledger={:.6f} vs broker={:.6f} ({:.0%}) - "
+                        "possible split/corporate action; review (basis left unchanged).",
+                        sym, pos["qty"], broker_qty, drift)
+                    notes.append(f"{sym} qty drift {pos['qty']:.4f}->{broker_qty:.4f} (possible split)")
+        return notes
 
     def daily_stats(self, equity: float) -> dict[str, Any]:
         return {

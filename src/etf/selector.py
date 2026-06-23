@@ -18,6 +18,8 @@ import pandas as pd
 from src.momentum_allocator import MomentumRotation
 from src.strategy import DonchianStrategy
 
+from .dual_momentum import DualMomentumSelector
+
 
 def _shim_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
     """Build the minimal cfg shape the reused crypto components expect from the
@@ -67,3 +69,16 @@ class EtfMomentumSelector:
              held: list[str]) -> dict[str, Any]:
         """Target set + enter/exit lists to reach the strongest-K eligible ETFs."""
         return self.rotation.plan(self.candidates(frames_by_symbol), held)
+
+
+def build_selector(cfg: dict[str, Any]):
+    """Pick the selector by `etf.selection.mode`:
+      * "rotation" (default)     -> EtfMomentumSelector (Donchian-gated top-K rotation),
+      * "dual_momentum"          -> DualMomentumSelector (abs+rel + defensive sleeve).
+    Both expose the same interface (is_due / plan / top_k), so the loop and
+    backtester are mode-agnostic.
+    """
+    mode = str(cfg["etf"].get("selection", {}).get("mode", "rotation")).lower()
+    if mode == "dual_momentum":
+        return DualMomentumSelector(cfg)
+    return EtfMomentumSelector(cfg)
