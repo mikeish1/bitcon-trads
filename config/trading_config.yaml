@@ -470,9 +470,15 @@ etf:
   # Diversified, liquid ETFs across asset classes (equities/intl/bonds/gold/cmdty/RE).
   universe: [SPY, QQQ, IWM, EFA, EEM, TLT, IEF, GLD, DBC, VNQ]
   selection:
-    # Selector: "rotation" (Donchian-gated top-K, the original) | "dual_momentum"
-    # (Antonacci GEM-style abs+rel momentum + defensive sleeve - the design selected
-    # for a small TAXABLE account; see docs/equities_replatform/). Env: ETF_SELECTION_MODE.
+    # Selector mode (Env: ETF_SELECTION_MODE):
+    #   "rotation"          - Donchian-gated top-K momentum rotation (original).
+    #   "dual_momentum"     - Antonacci GEM-style abs+rel momentum + defensive sleeve.
+    #   "static_allocation" - fixed-weight buy-and-hold-rebalance (e.g. 40/40/20
+    #                         SPY/AGG/GLD). *** The Stage-4 VALIDATED winner for a small
+    #                         taxable account *** (beat momentum AND SPY/60-40 on
+    #                         risk-adjusted, after-tax, OOS terms; see validation_report.md).
+    # Default stays "rotation" to preserve live behaviour; switch to "static_allocation"
+    # to run the validated sleeve. See docs/equities_replatform/.
     mode: "rotation"
     entry_period: 40               # Donchian breakout window (the trend filter)
     atr_trail_mult: 3.0            # chandelier used by active_state (same as crypto)
@@ -496,6 +502,16 @@ etf:
     rebalance_days: 20                 # ~monthly cadence
     keep_band: 0                       # rank hysteresis
     min_history: 260                   # need >= lookback + buffer bars before trading
+
+  # --- Static fixed-weight allocation (only used when mode == static_allocation) -
+  # The VALIDATED ETF sleeve: a diversified buy-and-hold-rebalance blend. Rebalances
+  # only every `rebalance_days` AND only the symbols drifted beyond `drift_band` of
+  # equity - so turnover (and taxable realization) stays minimal (≈11 trades / 18y in
+  # backtest, long-term gains only). In this mode the universe = the weighted symbols.
+  static_allocation:
+    weights: {SPY: 0.40, AGG: 0.40, GLD: 0.20}   # US equity / US agg bonds / gold
+    rebalance_days: 63                 # ~quarterly rebalance clock
+    drift_band: 0.05                   # only trade a symbol drifted > +/-5% of equity
 
   # Pattern-Day-Trader guard: never round-trip a symbol the same day it opened (the
   # design holds multi-day/weekly, so this only blocks accidental same-day exits).

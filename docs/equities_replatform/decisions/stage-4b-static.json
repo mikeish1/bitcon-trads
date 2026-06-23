@@ -1,0 +1,47 @@
+{
+  "handoff": {
+    "step_id": "stage-4b-static-allocation",
+    "status": "success",
+    "confidence": 0.88,
+    "key_outputs": {
+      "decision": "PIVOT to static fixed-weight sleeve after DM failed; human selected Diversified 40/40/20 SPY/AGG/GLD",
+      "validation_PASS": "trade-based sim (real tax/turnover): Sharpe 0.90 / OOS 1.09, maxDD 21.1% / OOS 18.2%, CAGR 8.2%; 11 trades in 18y, 0.2x turnover, 100% long-term gains (~13% drag)",
+      "beats": "Dual Momentum (0.41/34%), SPY (0.68/47%), 60/40 (0.77/30%) on risk-adjusted + after-tax; wins/ties every regime incl COVID +2.8% (DM -24.7%)",
+      "gates": "PASS G1-G7 (sensitivity flat: Sharpe 0.88-0.99 across weights x band; MC median Sharpe 0.92, p5 CAGR +4.8%)",
+      "implementation": "StaticAllocator (selection.mode static_allocation), partial avg-cost trims/adds in EtfRiskManager, _rebalance_static loop path, simulate_static harness; default mode stays rotation (off)",
+      "tests": "261 passed (+7 static)"
+    },
+    "assumptions": [
+      "default 40/40/20 SPY/AGG/GLD, quarterly clock, 5% drift band",
+      "live deployable via Alpaca paper; momentum modes remain off"
+    ],
+    "open_issues": [
+      "Stage 5: wire to Alpaca paper, monitoring, runbook, paper acceptance criteria",
+      "Stage 6: go-live readiness package",
+      "IEF variant edged slightly better than AGG - optional future tweak, not blocking"
+    ],
+    "artifacts": [
+      "src/etf/static_allocation.py", "src/etf/research/harness.py (simulate_static)",
+      "src/etf/risk.py (add_to_position/trim_position)", "src/etf/main.py (_rebalance_static)",
+      "tests/test_etf_static.py", "docs/equities_replatform/validation_report.md (sec 8)",
+      "docs/equities_replatform/adr.md (ADR-007)"
+    ],
+    "verification_passed": true,
+    "next_focus": "Stage 5: paper deployment of static_allocation on Alpaca paper + monitoring + runbook + acceptance criteria."
+  },
+  "judge": {
+    "overall_score": 8.9,
+    "decision": "pass",
+    "dimensions": {
+      "correctness": {"score": 9, "reasoning": "Static allocator + partial add/trim + trade-based sim unit-tested (261 green); validation numbers reproduced via the same realistic cost/tax machinery, not the returns approximation."},
+      "methodological_rigor": {"score": 9, "reasoning": "Same harness, real tax/turnover, IS/OOS, 4 regimes, MC, weight x band sensitivity; honest about the favorable OOS window."},
+      "robustness": {"score": 9, "reasoning": "Flat sensitivity across weights and bands; wins every regime; MC p5 CAGR positive - the opposite of DM's fragility."},
+      "safety_compliance": {"score": 9, "reasoning": "Default mode unchanged (off); tripwire/clock/PDT/reconcile preserved; partial trims never misstate basis (avg-cost, realized accrued)."},
+      "simplicity": {"score": 9, "reasoning": "The whole point - a 3-line weight map beats every active design; minimal new live surface (one allocator + two ledger methods + one loop path)."},
+      "clarity": {"score": 9, "reasoning": "Report addendum quantifies the PASS vs every alternative; ADR-007 records the pivot and the partial-position design."}
+    },
+    "issues_found": ["Favorable 2017-26 OOS window (disclosed)", "AGG vs IEF is a minor open optimization"],
+    "suggested_revisions": ["Proceed to Stage 5 paper deploy of static_allocation"],
+    "confidence_in_judgment": 0.86
+  }
+}

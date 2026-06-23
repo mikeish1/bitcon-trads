@@ -68,14 +68,25 @@ def load_etf_config() -> dict[str, Any]:
     # exits). Keeps a <$25k margin account clear of the 3-day-trades/5-day rule.
     e["pdt_guard"] = _env_bool("ETF_PDT_GUARD", bool(e.get("pdt_guard", True)))
 
-    # In dual-momentum mode the tradable universe is the union of the offensive +
-    # defensive sleeves (unless ETF_UNIVERSE was set explicitly).
-    if sel["mode"] == "dual_momentum" and not uni_env:
+    # --- Static fixed-weight allocation (mode: static_allocation) ----------------
+    # The Stage-4-VALIDATED ETF sleeve: a diversified buy-and-hold-rebalance blend
+    # (default 40% SPY / 40% AGG / 20% GLD). Drift-band + slow clock keep turnover
+    # (and taxable realization) minimal. See docs/equities_replatform/validation_report.md.
+    sa = e.setdefault("static_allocation", {})
+    sa.setdefault("weights", {"SPY": 0.40, "AGG": 0.40, "GLD": 0.20})
+    sa.setdefault("rebalance_days", 63)       # ~quarterly
+    sa.setdefault("drift_band", 0.05)         # only trade a symbol drifted > +/-5% of equity
+
+    # The tradable universe follows the selected mode's symbols (unless ETF_UNIVERSE
+    # was set explicitly).
+    if not uni_env and sel["mode"] == "dual_momentum":
         seen: list[str] = []
         for s in [*dm["offensive"], *dm["defensive"]]:
             if s.upper() not in seen:
                 seen.append(s.upper())
         e["universe"] = seen
+    elif not uni_env and sel["mode"] == "static_allocation":
+        e["universe"] = [str(s).upper() for s in sa["weights"]]
 
     cap = e.setdefault("capital", {})
     cap["sleeve_usd"] = _env_float("ETF_SLEEVE_USD", cap.get("sleeve_usd", 2000.0))

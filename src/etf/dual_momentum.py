@@ -53,6 +53,7 @@ class DualMomentumSelector:
         }
         self.rotation = MomentumRotation(shim)
         self.top_k = self.rotation.top_k
+        self.rebalance_days = self.rotation.rebalance_days
 
     # ------------------------------------------------------------------ #
     def is_due(self, last_day_iso: str | None, today_iso: str) -> bool:

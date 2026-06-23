@@ -101,3 +101,43 @@ stays `rotation`); nothing is enabled. No real money is at stake.
 - **Slippage** fixed at 5 bps/side; these liquid ETFs trade tighter, so costs are if
   anything conservative — and DM already loses gross.
 - **Survivorship:** broad flagship ETFs (low risk), per [data_bias_audit.md](data_bias_audit.md).
+
+---
+
+## 8. Addendum — the chosen replacement: **Static 40/40/20 (SPY/AGG/GLD) PASSES** ✅
+
+After the negative verdict, the human (Stage-1 revisited) selected a simple
+fixed-weight sleeve. Validated through the **same trade-based, gap-aware simulator**
+(`simulate_static`, real tax + turnover, drift-band 5%, ~quarterly), 2008-07→2026-06:
+
+| Metric | Static 40/40/20 | vs Dual Momentum | vs SPY | vs 60/40 |
+|---|---|---|---|---|
+| CAGR | 8.2% | 6.0% | 12.2% | 9.0% |
+| **max drawdown** | **21.1%** | 33.7% | 47.2% | 29.7% |
+| **Sharpe** | **0.90** | 0.41 | 0.68 | 0.77 |
+| Sortino / Calmar | 1.13 / 0.39 | 0.50 / 0.18 | 0.83 / 0.26 | 0.94 / 0.30 |
+| **OOS Sharpe** | **1.09** | 0.56 | 0.86 | 0.89 |
+| OOS maxDD | 18.2% | 33.7% | 33.7% | 21.7% |
+| **Trades (18y) / turnover** | **11 / 0.2×** | 64 / 8.5× | — | — |
+| **Tax** | **100% long-term, ~13% drag** | mixed, ~22% | ~0 | ~0 |
+
+**Regimes (return / maxDD):** GFC −7.9% / 21.1% · **COVID +2.8%** / 16.1% (DM was
+−24.7%) · 2022 −12.5% / 18.0% · Chop +6.2% / 6.6%. It wins or ties **every** regime.
+
+**Monte-Carlo** (n=1000): median Sharpe 0.92, median maxDD 18.8%, **p5 CAGR +4.8%**
+(DM's was ~0%). **Sensitivity:** across weight variants (35–45% SPY; AGG vs IEF; GLD
+15–25%) × drift band (3–10%), Sharpe stays **0.88–0.99** and maxDD **18.6–21.7%** —
+flat, i.e. not a curve-fit. (Aside: SPY/**IEF**/GLD edged slightly higher, Sharpe
+~0.98 — intermediate Treasuries are a cleaner equity diversifier than AGG's credit;
+noted, but the selected AGG blend is the default.)
+
+**Decision rule:** **PASS** on all of G1 (OOS Sharpe 1.09 > both benchmarks),
+G2 (maxDD 21% < 25% and < SPY), G3, G4 (flat sensitivity), G5 (every regime),
+G6 (MC median clears the bar), G7 (0.2× turnover, long-term-only tax). **This is the
+design to take to paper (Stage 5).** Implemented as `selection.mode:
+static_allocation` (`StaticAllocator`), off by default until enabled for paper.
+
+> Same honest caveat: the 2017-26 OOS was a favorable stretch for diversified
+> portfolios apart from 2022. The durable, regime-robust claim is **lower drawdown +
+> better risk-adjusted, after-tax return than the active designs and than SPY** — not
+> a guaranteed ~1.0 Sharpe going forward.

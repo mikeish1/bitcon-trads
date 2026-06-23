@@ -159,6 +159,62 @@ class EtfRiskManager:
                     fill["price"], pnl, reason)
         return pnl
 
+    # --- partial adjustments (static-allocation rebalancing) ------------------ #
+    def position_value(self, symbol: str, prices: dict[str, float]) -> float:
+        pos = self.open_position(symbol)
+        if pos is None:
+            return 0.0
+        return pos["qty"] * prices.get(symbol, pos["entry_price"])
+
+    def add_to_position(self, symbol: str, fill: dict[str, Any], reason: str) -> int:
+        """Add to an existing position (avg-cost), or open one if none. Used by the
+        static allocator to top a holding up toward its target weight."""
+        pos = self.open_position(symbol)
+        if pos is None:
+            return self.record_open(symbol, fill, reason)
+        new_qty = pos["qty"] + fill["qty"]
+        new_cost = pos["cost_usd"] + fill["cost"]
+        new_entry = new_cost / new_qty if new_qty else fill["price"]
+        self.conn.execute(
+            "UPDATE etf_positions SET qty=?, cost_usd=?, entry_price=?, entry_fee=? WHERE id=?",
+            (new_qty, new_cost, new_entry, (pos["entry_fee"] or 0.0) + fill.get("fee", 0.0), pos["id"]))
+        if not self.uses_broker:
+            self._set("paper_cash", self._getf("paper_cash") - (fill["cost"] + fill.get("fee", 0.0)))
+        self.conn.commit()
+        logger.info("ETF ADD {} +{:.4f} @ {:.2f} (${:.2f}) [{}]",
+                    symbol, fill["qty"], fill["price"], fill["cost"], self.mode)
+        return int(pos["id"])
+
+    def trim_position(self, position: sqlite3.Row, qty: float, price: float,
+                      fee: float = 0.0, reason: str = "rebalance trim") -> float:
+        """Sell PART of a position at avg cost (realizes proportional PnL, accrued to
+        etf_realized_pnl). Fully closes it if the residual is below dust. Returns the
+        realized PnL on the trimmed shares."""
+        qty = min(qty, position["qty"])
+        if qty <= 0:
+            return 0.0
+        avg = position["entry_price"]
+        proceeds = qty * price - fee
+        realized = proceeds - qty * avg
+        new_qty = position["qty"] - qty
+        new_cost = position["cost_usd"] - qty * avg
+        if not self.uses_broker:
+            self._set("paper_cash", self._getf("paper_cash") + proceeds)
+        self._set("etf_realized_pnl", self._getf("etf_realized_pnl") + realized)
+        dust = self.min_notional / price if price else 0.0
+        if new_qty <= dust:
+            self.conn.execute(
+                "UPDATE etf_positions SET status='CLOSED', closed_at=?, exit_price=?, exit_fee=?, "
+                "realized_pnl_usd=?, reason=? WHERE id=?",
+                (_utcnow().isoformat(), price, fee, realized, reason, position["id"]))
+        else:
+            self.conn.execute("UPDATE etf_positions SET qty=?, cost_usd=? WHERE id=?",
+                              (new_qty, new_cost, position["id"]))
+        self.conn.commit()
+        logger.info("ETF TRIM {} -{:.4f} @ {:.2f} | realized ${:.2f} | {}",
+                    position["symbol"], qty, price, realized, reason)
+        return realized
+
     def opened_today(self, position: sqlite3.Row, today_iso: str) -> bool:
         """True if the position opened on the given calendar day (UTC). Drives the
         loop's PDT same-day guard, which prevents a same-day round-trip."""

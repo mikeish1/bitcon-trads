@@ -205,6 +205,123 @@ def simulate(panel: dict[str, pd.DataFrame], selector: Any, *, tf: str = "1d",
                      cash_symbol=cash_symbol)
 
 
+def simulate_static(panel: dict[str, pd.DataFrame], allocator: Any, *, tf: str = "1d",
+                    warmup: int = 2, cost: Optional[CostModel] = None,
+                    initial: float = 10_000.0, start: Optional[str] = None,
+                    end: Optional[str] = None) -> SimResult:
+    """Trade-based simulation of a FIXED-WEIGHT allocator: rebalance to target weights
+    on the allocator's clock, but only trade a symbol whose weight has drifted beyond
+    its band (low turnover -> low tax). Sells execute before buys (to free cash);
+    fills at the next open with slippage. Partial trims use FIFO lots."""
+    cost = cost or CostModel()
+    weights = allocator.target_weights()
+    band = float(getattr(allocator, "drift_band", 0.0))
+    closes = {s: df.set_index("timestamp")["close"] for s, df in panel.items()}
+    opens = {s: df.set_index("timestamp")["open"] for s, df in panel.items()}
+    grid = sorted(set().union(*[set(df["timestamp"]) for df in panel.values()]))
+    if start:
+        grid = [t for t in grid if _iso(t) >= start]
+    if end:
+        grid = [t for t in grid if _iso(t) <= end]
+
+    cash = float(initial)
+    lots: dict[str, list[Lot]] = {}
+    realized: list[Realized] = []
+    turnover = 0.0
+    pending = False
+    last_rebal: Optional[str] = None
+    curve_idx: list[Any] = []
+    curve_val: list[float] = []
+
+    def price(series: pd.Series, t: Any) -> Optional[float]:
+        v = series.get(t)
+        return float(v) if (v is not None and v == v and v > 0) else None
+
+    def held_qty(sym: str) -> float:
+        return sum(lot.qty for lot in lots.get(sym, []))
+
+    def buy(sym: str, spend: float, px: float, d: date) -> None:
+        nonlocal cash, turnover
+        spend = min(spend, cash)
+        if spend <= 0:
+            return
+        bp = cost.buy_px(px)
+        qty = (spend - cost.commission(spend)) / bp
+        if qty <= 0:
+            return
+        cash -= spend
+        turnover += qty * px
+        lots.setdefault(sym, []).append(Lot(qty, d, bp))
+
+    def sell_qty(sym: str, qty: float, px: float, d: date) -> None:
+        nonlocal cash, turnover
+        qty = min(qty, held_qty(sym))
+        if qty <= 0:
+            return
+        sp = cost.sell_px(px)
+        remaining, basis, sold = qty, 0.0, 0.0
+        new_lots: list[Lot] = []
+        entry0 = lots[sym][0].entry_date
+        for lot in lots.get(sym, []):
+            if remaining <= 1e-12:
+                new_lots.append(lot)
+                continue
+            take = min(lot.qty, remaining)
+            basis += take * lot.entry_px
+            sold += take
+            remaining -= take
+            if lot.qty - take > 1e-12:
+                new_lots.append(Lot(lot.qty - take, lot.entry_date, lot.entry_px))
+        proceeds = sold * sp - cost.commission(sold * sp)
+        cash += proceeds
+        turnover += sold * px
+        realized.append(Realized(sym, sold, entry0, d, proceeds, basis))
+        lots[sym] = new_lots
+
+    for i, t in enumerate(grid):
+        d = pd.Timestamp(t).date()
+        if pending and i > 0:
+            symbols = set(weights) | {s for s in lots if held_qty(s) > 0}
+            px_at = {s: price(opens[s], t) for s in symbols}
+            eq_open = cash + sum(held_qty(s) * (px_at[s] or 0.0) for s in symbols)
+            tgt = {s: weights.get(s, 0.0) * eq_open for s in symbols}
+            for s in symbols:                                   # sells first (free cash)
+                px = px_at[s]
+                if px is None:
+                    continue
+                cur = held_qty(s) * px
+                if held_qty(s) > 0 and eq_open > 0 and abs(cur - tgt[s]) / eq_open < band:
+                    continue
+                if cur - tgt[s] > 0:
+                    sell_qty(s, (cur - tgt[s]) / cost.sell_px(px), px, d)
+            for s in symbols:                                   # then buys
+                px = px_at[s]
+                if px is None:
+                    continue
+                cur = held_qty(s) * px
+                if held_qty(s) > 0 and eq_open > 0 and abs(cur - tgt[s]) / eq_open < band:
+                    continue
+                if tgt[s] - cur > 0:
+                    buy(s, tgt[s] - cur, px, d)
+            pending = False
+
+        eq = cash
+        for s in list(lots):
+            q = held_qty(s)
+            if q > 0:
+                eq += q * (price(closes[s], t) or lots[s][-1].entry_px)
+        curve_idx.append(t)
+        curve_val.append(eq)
+
+        if i >= warmup and allocator.is_due(last_rebal, _iso(t)):
+            pending = True
+            last_rebal = _iso(t)
+
+    curve = pd.Series(curve_val, index=pd.to_datetime(curve_idx))
+    return SimResult(curve=curve, realized=realized, turnover_notional=turnover,
+                     days=len(curve), days_in_risk=len(curve), initial=initial)
+
+
 # --------------------------------------------------------------------------- #
 # Metrics                                                                     #
 # --------------------------------------------------------------------------- #
@@ -342,6 +459,48 @@ def sixty_forty_curve(eq_df: pd.DataFrame, bond_df: pd.DataFrame, *, initial: fl
         # weight drifts intra-period; reset at each rebalance mark
         if t in marks:
             w = w_eq
+        out.append(val)
+    return pd.Series(out, index=idx)
+
+
+def static_blend_curve(panel: dict[str, pd.DataFrame], weights: dict[str, float], *,
+                       initial: float = 10_000.0, rebalance: str = "Q",
+                       start: Optional[str] = None, end: Optional[str] = None) -> pd.Series:
+    """Buy-and-hold a FIXED-WEIGHT multi-asset blend, rebalanced to target weights
+    each period (Q = quarter-end, M = month-end, A = year-end). Tracks per-asset
+    dollar holdings so weight drift compounds correctly between rebalances. Turnover
+    (and hence tax) is minimal - only the rebalance trims trade."""
+    syms = [s for s in weights if s in panel]
+    closes = {s: panel[s].set_index("timestamp")["close"].astype(float) for s in syms}
+    idx = None
+    for s in syms:
+        idx = closes[s].index if idx is None else idx.intersection(closes[s].index)
+    if start:
+        idx = idx[idx >= pd.Timestamp(start, tz="UTC")]
+    if end:
+        idx = idx[idx <= pd.Timestamp(end, tz="UTC")]
+    if idx is None or len(idx) < 2:
+        return pd.Series(dtype=float)
+    rets = {s: closes[s].reindex(idx).pct_change().fillna(0.0) for s in syms}
+    if rebalance.upper().startswith("Q"):
+        key = [idx.year, idx.quarter]
+    elif rebalance.upper().startswith("A"):
+        key = [idx.year]
+    else:
+        key = [idx.year, idx.month]
+    marks = set(pd.Series(idx).groupby(key).last().values)
+
+    wsum = sum(weights[s] for s in syms)
+    holdings = {s: initial * weights[s] / wsum for s in syms}
+    out: list[float] = []
+    for i, t in enumerate(idx):
+        if i > 0:
+            for s in syms:
+                holdings[s] *= (1 + rets[s][t])
+        val = sum(holdings.values())
+        if i > 0 and t in marks:
+            for s in syms:
+                holdings[s] = val * weights[s] / wsum
         out.append(val)
     return pd.Series(out, index=idx)
 

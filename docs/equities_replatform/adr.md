@@ -65,3 +65,20 @@ regime switch into the defensive sleeve), not across simultaneous correlated hol
 1/K + the existing exposure/capital caps suffice at `top_k` 1–2.
 **Consequences.** Keeps the parameter count minimal (the design's main OOS-robustness
 advantage). If `top_k` is later raised with correlated offensive names, revisit.
+
+## ADR-007 — Pivot to a static fixed-weight sleeve after validation *(Stage 4 → Stage 1 revisited)*
+**Context.** Stage-4 validation on real 2008-2026 data showed Dual Momentum fails the
+deploy gate (5/7), losing to SPY and 60/40 after cost and tax (it was whipsawed
+outside the GFC). The binding decision rule requires reporting that plainly and
+preferring a simpler design.
+**Decision.** Implement a **static fixed-weight allocation** (`StaticAllocator`,
+`selection.mode: static_allocation`; default 40% SPY / 40% AGG / 20% GLD) as the
+deployable ETF sleeve. It rebalances to target weights on a slow clock with a drift
+band, using **partial avg-cost trims/adds** (`EtfRiskManager.add_to_position` /
+`trim_position`) — NOT whole-position rotation — so turnover and taxable realization
+stay minimal. The momentum modes remain in the repo, off.
+**Consequences.** Validated PASS on all 7 gates (Sharpe 0.90 / OOS 1.09, maxDD 21%,
+11 trades in 18y, long-term-only tax). The live loop branches into a dedicated
+`_rebalance_static` path. The selector interface gains `target_weights`; the risk
+ledger gains partial-position support (one OPEN row per symbol, avg cost, realized
+PnL accrued to `etf_realized_pnl`). This is the design carried into Stages 5-6.

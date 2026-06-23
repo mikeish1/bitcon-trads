@@ -19,6 +19,7 @@ from src.momentum_allocator import MomentumRotation
 from src.strategy import DonchianStrategy
 
 from .dual_momentum import DualMomentumSelector
+from .static_allocation import StaticAllocator
 
 
 def _shim_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -50,6 +51,7 @@ class EtfMomentumSelector:
         self.donchian = DonchianStrategy(shim)       # reused verbatim
         self.rotation = MomentumRotation(shim)       # reused verbatim
         self.top_k = self.rotation.top_k
+        self.rebalance_days = self.rotation.rebalance_days
 
     def is_due(self, last_day_iso: str | None, today_iso: str) -> bool:
         return self.rotation.is_due(last_day_iso, today_iso)
@@ -73,12 +75,16 @@ class EtfMomentumSelector:
 
 def build_selector(cfg: dict[str, Any]):
     """Pick the selector by `etf.selection.mode`:
-      * "rotation" (default)     -> EtfMomentumSelector (Donchian-gated top-K rotation),
-      * "dual_momentum"          -> DualMomentumSelector (abs+rel + defensive sleeve).
-    Both expose the same interface (is_due / plan / top_k), so the loop and
-    backtester are mode-agnostic.
+      * "rotation" (default)  -> EtfMomentumSelector (Donchian-gated top-K rotation),
+      * "dual_momentum"       -> DualMomentumSelector (abs+rel + defensive sleeve),
+      * "static_allocation"   -> StaticAllocator (the Stage-4-validated fixed-weight
+                                 buy-and-hold-rebalance sleeve, e.g. 40/40/20 SPY/AGG/GLD).
+    All expose is_due / plan / top_k. The momentum selectors do whole-position
+    enter/exit; the static allocator rebalances to target WEIGHTS (loop branches on it).
     """
     mode = str(cfg["etf"].get("selection", {}).get("mode", "rotation")).lower()
     if mode == "dual_momentum":
         return DualMomentumSelector(cfg)
+    if mode == "static_allocation":
+        return StaticAllocator(cfg)
     return EtfMomentumSelector(cfg)

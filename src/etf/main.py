@@ -53,9 +53,9 @@ class EtfBot:
         self.running = True
         self._mode = _MODE_LABEL.get(self.rt["mode"], self.rt["mode"])
         logger.info("=" * 70)
-        logger.info("ETF Bot | venue={} | mode={} | selector={} | top-{} of {} ETFs, rotate every {}d",
+        logger.info("ETF Bot | venue={} | mode={} | selector={} | {} of {} ETFs, rebalance every {}d",
                     self.rt["venue"], self._mode, self.sel_mode, self.selector.top_k,
-                    len(self.universe), self.selector.rotation.rebalance_days)
+                    len(self.universe), self.selector.rebalance_days)
         logger.info("=" * 70)
         signal.signal(signal.SIGINT, self._sig)
         signal.signal(signal.SIGTERM, self._sig)
@@ -122,6 +122,57 @@ class EtfBot:
             logger.info("ETF regime flip: {} -> {}", prev or "?", regime)
             self.notifier.message(f"📈ETF regime: {prev or '?'} -> {regime}")
 
+    def _rebalance_static(self, prices: dict[str, float], today: str) -> None:
+        """Rebalance the fixed-weight sleeve toward target weights: trim/add only the
+        symbols whose weight has drifted beyond the band (low turnover). Sells run
+        before buys so cash is freed first."""
+        weights = self.selector.target_weights()
+        band = self.selector.drift_band
+        equity = self.risk.current_equity(self._balances(), prices)
+        deployable = equity * self.risk.max_exposure
+        targets = {s: weights.get(s, 0.0) * deployable
+                   for s in set(weights) | set(self.risk.held_symbols())}
+        traded = False
+
+        for sym in sorted(targets):                       # 1) trims (free cash first)
+            if sym not in prices:
+                continue
+            pos = self.risk.open_position(sym)
+            cur = pos["qty"] * prices[sym] if pos else 0.0
+            if pos and equity > 0 and abs(cur - targets[sym]) / equity < band:
+                continue
+            over = cur - targets[sym]
+            if pos and over > self.risk.min_notional:
+                qty = min(pos["qty"], over / prices[sym])
+                fill = self.executor.market_sell(sym, qty, prices[sym], "static rebalance trim")
+                if fill:
+                    pnl = self.risk.trim_position(pos, fill["qty"], fill["price"],
+                                                  fill.get("fee", 0.0))
+                    traded = True
+                    self.notifier.message(f"🔻 📈ETF TRIM {sym}\nrealized ${pnl:,.2f}")
+
+        cash = self.risk.available_cash(self._balances())
+        for sym in sorted(weights):                       # 2) adds toward target
+            if sym not in prices:
+                continue
+            pos = self.risk.open_position(sym)
+            cur = pos["qty"] * prices[sym] if pos else 0.0
+            if pos and equity > 0 and abs(cur - targets[sym]) / equity < band:
+                continue
+            spend = min(targets[sym] - cur, cash)
+            if spend > self.risk.min_notional:
+                fill = self.executor.market_buy(sym, spend, prices[sym])
+                if fill:
+                    self.risk.add_to_position(sym, fill, "static rebalance add")
+                    cash -= fill["cost"] + fill.get("fee", 0.0)
+                    traded = True
+                    self.notifier.message(f"🟢 📈ETF ADD {sym}\nSize: ${fill['cost']:,.2f}")
+
+        self.risk.state_set("etf_last_rebalance", today)
+        stats = self.risk.daily_stats(self.risk.current_equity(self._balances(), prices))
+        logger.info("ETF static {} {} | {}", "rebalanced" if traded else "in-band (no trades)",
+                    today, stats)
+
     # ------------------------------------------------------------------ #
     def _cycle(self) -> None:
         frames_by_symbol: dict[str, dict[str, pd.DataFrame]] = {}
@@ -156,6 +207,12 @@ class EtfBot:
         if not self.selector.is_due(self.risk.state_get("etf_last_rebalance"), today):
             logger.info("ETF hold (not a rebalance day). Equity ${:.2f}, held {}.",
                         equity, self.risk.held_symbols())
+            return
+
+        # Static allocation rebalances to target WEIGHTS (partial trims/adds), not the
+        # momentum whole-position enter/exit - a separate path.
+        if self.sel_mode == "static_allocation":
+            self._rebalance_static(prices, today)
             return
 
         held = self.risk.held_symbols()
