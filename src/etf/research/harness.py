@@ -22,6 +22,8 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from src.etf.static_allocation import rebalance_deltas
+
 
 # --------------------------------------------------------------------------- #
 # Cost model                                                                  #
@@ -207,8 +209,8 @@ def simulate(panel: dict[str, pd.DataFrame], selector: Any, *, tf: str = "1d",
 
 def simulate_static(panel: dict[str, pd.DataFrame], allocator: Any, *, tf: str = "1d",
                     warmup: int = 2, cost: Optional[CostModel] = None,
-                    initial: float = 10_000.0, start: Optional[str] = None,
-                    end: Optional[str] = None) -> SimResult:
+                    initial: float = 10_000.0, min_notional: float = 0.0,
+                    start: Optional[str] = None, end: Optional[str] = None) -> SimResult:
     """Trade-based simulation of a FIXED-WEIGHT allocator: rebalance to target weights
     on the allocator's clock, but only trade a symbol whose weight has drifted beyond
     its band (low turnover -> low tax). Sells execute before buys (to free cash);
@@ -283,26 +285,18 @@ def simulate_static(panel: dict[str, pd.DataFrame], allocator: Any, *, tf: str =
         if pending and i > 0:
             symbols = set(weights) | {s for s in lots if held_qty(s) > 0}
             px_at = {s: price(opens[s], t) for s in symbols}
-            eq_open = cash + sum(held_qty(s) * (px_at[s] or 0.0) for s in symbols)
-            tgt = {s: weights.get(s, 0.0) * eq_open for s in symbols}
-            for s in symbols:                                   # sells first (free cash)
-                px = px_at[s]
-                if px is None:
-                    continue
-                cur = held_qty(s) * px
-                if held_qty(s) > 0 and eq_open > 0 and abs(cur - tgt[s]) / eq_open < band:
-                    continue
-                if cur - tgt[s] > 0:
-                    sell_qty(s, (cur - tgt[s]) / cost.sell_px(px), px, d)
-            for s in symbols:                                   # then buys
-                px = px_at[s]
-                if px is None:
-                    continue
-                cur = held_qty(s) * px
-                if held_qty(s) > 0 and eq_open > 0 and abs(cur - tgt[s]) / eq_open < band:
-                    continue
-                if tgt[s] - cur > 0:
-                    buy(s, tgt[s] - cur, px, d)
+            tradable = [s for s in symbols if px_at[s] is not None]
+            cur_val = {s: held_qty(s) * px_at[s] for s in tradable}
+            eq_open = cash + sum(cur_val.values())
+            # Shared pure decision (same function the live loop uses -> no drift).
+            deltas = rebalance_deltas(cur_val, {s: weights.get(s, 0.0) for s in tradable},
+                                      eq_open, band=band, min_notional=min_notional)
+            for s, delta in deltas.items():                     # sells first (free cash)
+                if delta < 0:
+                    sell_qty(s, (-delta) / cost.sell_px(px_at[s]), px_at[s], d)
+            for s, delta in deltas.items():                     # then buys
+                if delta > 0:
+                    buy(s, delta, px_at[s], d)
             pending = False
 
         eq = cash

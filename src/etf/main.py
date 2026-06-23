@@ -27,6 +27,7 @@ from .data import EtfData
 from .executor import EtfExecutor
 from .risk import EtfRiskManager
 from .selector import build_selector
+from .static_allocation import rebalance_deltas
 
 _MODE_LABEL = {"live": "LIVE (REAL MONEY)", "paper-broker": "PAPER-BROKER (Alpaca paper, no money)",
                "sim": "SIM (paper ledger, live data)"}
@@ -127,39 +128,34 @@ class EtfBot:
         symbols whose weight has drifted beyond the band (low turnover). Sells run
         before buys so cash is freed first."""
         weights = self.selector.target_weights()
-        band = self.selector.drift_band
         equity = self.risk.current_equity(self._balances(), prices)
         deployable = equity * self.risk.max_exposure
-        targets = {s: weights.get(s, 0.0) * deployable
-                   for s in set(weights) | set(self.risk.held_symbols())}
+        symbols = set(weights) | set(self.risk.held_symbols())
+        cur_val = {s: self.risk.position_value(s, prices) for s in symbols if s in prices}
+        # SAME pure decision the backtest simulator uses -> live == backtest (R3).
+        deltas = rebalance_deltas(cur_val, weights, deployable,
+                                  band=self.selector.drift_band,
+                                  min_notional=self.risk.min_notional)
         traded = False
 
-        for sym in sorted(targets):                       # 1) trims (free cash first)
-            if sym not in prices:
+        for sym, delta in sorted(deltas.items()):         # 1) trims (free cash first)
+            if delta >= 0 or sym not in prices:
                 continue
             pos = self.risk.open_position(sym)
-            cur = pos["qty"] * prices[sym] if pos else 0.0
-            if pos and equity > 0 and abs(cur - targets[sym]) / equity < band:
+            if pos is None:
                 continue
-            over = cur - targets[sym]
-            if pos and over > self.risk.min_notional:
-                qty = min(pos["qty"], over / prices[sym])
-                fill = self.executor.market_sell(sym, qty, prices[sym], "static rebalance trim")
-                if fill:
-                    pnl = self.risk.trim_position(pos, fill["qty"], fill["price"],
-                                                  fill.get("fee", 0.0))
-                    traded = True
-                    self.notifier.message(f"🔻 📈ETF TRIM {sym}\nrealized ${pnl:,.2f}")
+            qty = min(pos["qty"], (-delta) / prices[sym])
+            fill = self.executor.market_sell(sym, qty, prices[sym], "static rebalance trim")
+            if fill:
+                pnl = self.risk.trim_position(pos, fill["qty"], fill["price"], fill.get("fee", 0.0))
+                traded = True
+                self.notifier.message(f"🔻 📈ETF TRIM {sym}\nrealized ${pnl:,.2f}")
 
         cash = self.risk.available_cash(self._balances())
-        for sym in sorted(weights):                       # 2) adds toward target
-            if sym not in prices:
+        for sym, delta in sorted(deltas.items()):         # 2) adds toward target
+            if delta <= 0 or sym not in prices:
                 continue
-            pos = self.risk.open_position(sym)
-            cur = pos["qty"] * prices[sym] if pos else 0.0
-            if pos and equity > 0 and abs(cur - targets[sym]) / equity < band:
-                continue
-            spend = min(targets[sym] - cur, cash)
+            spend = min(delta, cash)
             if spend > self.risk.min_notional:
                 fill = self.executor.market_buy(sym, spend, prices[sym])
                 if fill:

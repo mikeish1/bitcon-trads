@@ -11,8 +11,26 @@ import pandas as pd
 from src.etf.research.harness import CostModel, simulate_static
 from src.etf.risk import EtfRiskManager
 from src.etf.selector import build_selector
-from src.etf.static_allocation import StaticAllocator
+from src.etf.static_allocation import StaticAllocator, rebalance_deltas
 from tests.conftest import etf_cfg
+
+
+def test_rebalance_deltas_shared_decision():
+    """The pure decision shared by the live loop and the backtest simulator (R3)."""
+    w = {"SPY": 0.4, "AGG": 0.4, "GLD": 0.2}
+    # On target -> no trades.
+    on_target = {"SPY": 4000.0, "AGG": 4000.0, "GLD": 2000.0}
+    assert rebalance_deltas(on_target, w, 10_000.0, band=0.05, min_notional=10.0) == {}
+    # Drifted: SPY rallied to 5000, GLD fell to 1000 -> trim SPY, add GLD (AGG within band).
+    drifted = {"SPY": 5000.0, "AGG": 4050.0, "GLD": 1000.0}
+    d = rebalance_deltas(drifted, w, 10_050.0, band=0.05, min_notional=10.0)
+    assert d["SPY"] < 0 and d["GLD"] > 0 and "AGG" not in d
+    # A held symbol with no target weight -> full sell.
+    d2 = rebalance_deltas({"QQQ": 1000.0}, w, 10_000.0, band=0.05, min_notional=10.0)
+    assert d2["QQQ"] == -1000.0
+    # Dust below min_notional -> skipped.
+    assert rebalance_deltas({"SPY": 4005.0}, {"SPY": 0.4}, 10_000.0,
+                            band=0.0, min_notional=10.0) == {}
 
 
 def _sa_cfg(weights, rebalance_days=63, drift_band=0.05):

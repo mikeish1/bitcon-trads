@@ -21,6 +21,28 @@ import pandas as pd
 DEFAULT_WEIGHTS = {"SPY": 0.40, "AGG": 0.40, "GLD": 0.20}
 
 
+def rebalance_deltas(current_value: dict[str, float], weights: dict[str, float],
+                     equity: float, *, band: float, min_notional: float) -> dict[str, float]:
+    """PURE rebalance decision shared by the live loop and the backtest simulator (so
+    they cannot drift - the golden-master for the static path).
+
+    Given each symbol's current market value, the target weights and total equity,
+    return {symbol: signed notional delta to trade} (positive = buy, negative = sell).
+    A symbol already held within the drift band is left alone; a delta below
+    min_notional is skipped (dust).
+    """
+    deltas: dict[str, float] = {}
+    for s in set(weights) | set(current_value):
+        cur = current_value.get(s, 0.0)
+        target = weights.get(s, 0.0) * equity
+        if cur > 0 and equity > 0 and abs(cur - target) / equity < band:
+            continue
+        d = target - cur
+        if abs(d) >= min_notional:
+            deltas[s] = d
+    return deltas
+
+
 class StaticAllocator:
     def __init__(self, cfg: dict[str, Any]):
         e = cfg["etf"]
