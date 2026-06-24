@@ -35,7 +35,7 @@ class AlpacaBroker(EtfBroker):
                 "Alpaca keys required for venue=alpaca (data needs them too). "
                 "Set ALPACA_API_KEY / ALPACA_API_SECRET (free paper keys work).")
         try:
-            from alpaca.data.enums import DataFeed
+            from alpaca.data.enums import Adjustment, DataFeed
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockBarsRequest
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -52,21 +52,28 @@ class AlpacaBroker(EtfBroker):
         self._AssetStatus = AssetStatus
         self._day = TimeFrame(1, TimeFrameUnit.Day)
         self._feed = DataFeed(str(cfg["etf"].get("alpaca_feed", "iex")))
+        # Split- AND dividend-adjust bars (default "all"). Alpaca's SDK defaults to
+        # RAW (unadjusted) bars, where a stock split prints a phantom -50%/-75% gap
+        # and ex-dividend prints a phantom gap-down - either of which fires a false
+        # Donchian trend exit and corrupts the momentum ranking. Adjusted bars are
+        # mandatory for a correct, backtest-matching signal. See docs/equities_replatform/
+        # data_bias_audit.md. Override (not recommended) via ETF_ALPACA_ADJUSTMENT.
+        self._adjustment = Adjustment(str(cfg["etf"].get("alpaca_adjustment", "all")).lower())
 
         self._data = StockHistoricalDataClient(rt["api_key"], rt["api_secret"])
         # Trading client is used for assets/clock/account reads even in sim; orders
         # are only submitted when place_orders is true.
         self._trading = TradingClient(rt["api_key"], rt["api_secret"], paper=rt["alpaca_paper"])
         self._place = rt["place_orders"]
-        logger.info("AlpacaBroker ready (paper={}, feed={}, orders={}).",
-                    rt["alpaca_paper"], self._feed.value, self._place)
+        logger.info("AlpacaBroker ready (paper={}, feed={}, adjustment={}, orders={}).",
+                    rt["alpaca_paper"], self._feed.value, self._adjustment.value, self._place)
 
     # --- market data --------------------------------------------------- #
     def daily_bars(self, symbol: str, lookback: int) -> pd.DataFrame:
         # Request more calendar days than trading days to cover weekends/holidays.
         start = datetime.now(timezone.utc) - timedelta(days=int(lookback * 1.6) + 15)
         req = self._StockBarsRequest(symbol_or_symbols=symbol, timeframe=self._day,
-                                     start=start, feed=self._feed)
+                                     start=start, feed=self._feed, adjustment=self._adjustment)
         df = self._data.get_stock_bars(req).df
         if df is None or df.empty:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])

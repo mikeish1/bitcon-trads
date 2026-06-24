@@ -1,0 +1,55 @@
+{
+  "handoff": {
+    "step_id": "stage-4-validation",
+    "status": "success",
+    "confidence": 0.86,
+    "key_outputs": {
+      "verdict": "DO NOT DEPLOY Dual Momentum - fails 5 of 7 deploy gates after realistic cost on real 2008-2026 data",
+      "dm_full": "CAGR 6.05% maxDD 33.7% Sharpe 0.41 Calmar 0.18; OOS Sharpe 0.56 Calmar 0.26",
+      "benchmarks": "SPY B&H Sharpe 0.68 (OOS 0.86); 60/40 Sharpe 0.77 (OOS 0.89) maxDD 29.7%/21.7% near-zero tax - 60/40 dominates the active designs risk-adjusted AND after-tax",
+      "control_a": "rotation: lowest maxDD 14.8% but worst tax drag ~43% and Sharpe 0.57 < 60/40; also not worth deploying",
+      "regimes": "DM edge is GFC-only; lost COVID 2020 (-24.7% vs SPY -3.9%, V-reversal), 2022 (-20.2%), chop 2015-16 (-5.3% vs +5.2%)",
+      "montecarlo": "median maxDD ~40%, median Sharpe 0.44, p5 CAGR ~0% - typical path also fails",
+      "sensitivity": "no config in lookback{126..315}xtopk{1,2} beats the benchmarks; 252-default sub-optimal",
+      "recommendation": "simpler approach wins: a low-turnover 60/40-style allocation. Either return to Stage 1 for a static/low-turnover sleeve, or add no ETF sleeve. DM stays OFF by default."
+    },
+    "assumptions": [
+      "5 bps/side slippage, commission-free, fills at next open (gap-aware)",
+      "taxable account (Stage-0): tax drag estimate weighted heavily",
+      "yfinance research-only data; warmup excludes the 2007 top (worst of GFC included)"
+    ],
+    "open_issues": [
+      "human sign-off on the negative verdict (mandatory, high financial impact)",
+      "decide: return to Stage 1 for a simple allocation, or stop and add no ETF sleeve",
+      "Stages 5-6 (paper deploy / go-live) only proceed for a design that PASSES - dual momentum does not"
+    ],
+    "artifacts": [
+      "src/etf/research/harness.py", "src/etf/research/feed.py", "src/etf/research/validate.py",
+      "tests/test_etf_research.py", "requirements-research.txt",
+      "docs/equities_replatform/validation_report.md",
+      "docs/equities_replatform/decisions/stage-4.json"
+    ],
+    "verification_passed": true,
+    "next_focus": "Human decision: the data says deploy a simple low-turnover allocation (60/40-style) or nothing. Do NOT paper-deploy dual momentum."
+  },
+  "judge": {
+    "overall_score": 8.8,
+    "decision": "pass",
+    "dimensions": {
+      "correctness": {"score": 9, "reasoning": "Harness pure functions unit-tested (cost/metrics/sim/benchmarks/tax/bootstrap); simulator verified to fill at next open + model gaps; benchmark CAGRs (SPY 12.2%, 60/40 8.95%) are plausible for the period."},
+      "methodological_rigor": {"score": 9, "reasoning": "Walk-forward IS/OOS, 4 regimes, block-bootstrap distribution, parameter sensitivity, realistic cost + gap-at-open, after-tax estimate, vs SPY and 60/40 and the incumbent control - all required elements present."},
+      "robustness": {"score": 9, "reasoning": "Verdict survives multiple independent gates (G1/G2/G5/G6/G7) and the full sensitivity grid; not a single-metric or single-path call."},
+      "safety_compliance": {"score": 9, "reasoning": "Research-only (no trading); yfinance isolated as a research dep; dual momentum stays OFF by default; honest negative verdict, no rationalizing a weak result."},
+      "simplicity": {"score": 8, "reasoning": "Harness is cohesive and pure; the recommendation explicitly favors the simplest winning approach (60/40) over added complexity."},
+      "clarity": {"score": 9, "reasoning": "Report quantifies every gate, names the failure modes (V-reversal, 2022 bonds+stocks, chop whipsaw), and states the recommendation plainly with honest limitations."}
+    },
+    "issues_found": [
+      "Tax model is a simplified estimate (relative comparison only)",
+      "252-warmup excludes the 2007 top (does not change the verdict)"
+    ],
+    "suggested_revisions": [
+      "Mandatory human sign-off on the negative verdict and the choice of next step (simple allocation vs no sleeve)"
+    ],
+    "confidence_in_judgment": 0.85
+  }
+}

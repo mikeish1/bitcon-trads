@@ -103,3 +103,66 @@ def seed_sample_db(db_path: str) -> dict[str, Any]:
     c.commit()
     c.close()
     return cfg
+
+
+def seed_sleeve_tables(db_path: str) -> None:
+    """Add representative CARRY and ETF rows to an existing DB, using each sleeve's
+    documented schema (src/carry/risk.py, src/etf/risk.py) via direct SQL.
+
+    We insert rows directly rather than constructing EtfRiskManager/CarryRiskManager
+    so the fixture stays light and the web read-path is exercised exactly as in
+    production (the dashboard never instantiates those read-write managers either)."""
+    import sqlite3
+
+    c = sqlite3.connect(db_path)
+    c.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS etf_state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS etf_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT, status TEXT, opened_at TEXT, closed_at TEXT,
+            qty REAL, entry_price REAL, cost_usd REAL, entry_fee REAL,
+            exit_price REAL, exit_fee REAL, realized_pnl_usd REAL, mode TEXT, reason TEXT);
+        CREATE TABLE IF NOT EXISTS carry_state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS carry_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset TEXT, status TEXT, opened_at TEXT, closed_at TEXT,
+            spot_qty REAL, spot_entry REAL, perp_qty REAL, perp_entry REAL,
+            notional_usd REAL, capital_usd REAL, funding_accrued_usd REAL, fees_usd REAL,
+            realized_pnl_usd REAL, low_reads INTEGER, last_accrual_ts REAL, mode TEXT, reason TEXT,
+            perp_closed INTEGER DEFAULT 0, spot_closed INTEGER DEFAULT 0,
+            perp_exit_price REAL, perp_exit_fee REAL, spot_exit_price REAL, spot_exit_fee REAL);
+        CREATE TABLE IF NOT EXISTS carry_funding (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, asset TEXT, rate_apr REAL, notional_usd REAL, amount_usd REAL);
+        """
+    )
+    # ETF: paper-cash ledger + one OPEN equity holding + one CLOSED winner.
+    c.executemany("INSERT INTO etf_state(key,value) VALUES(?,?)",
+                  [("paper_cash", "8000.0"), ("etf_last_rebalance", "2026-06-20"),
+                   ("etf_regime", "risk_on")])
+    c.execute("INSERT INTO etf_positions(symbol,status,opened_at,qty,entry_price,cost_usd,"
+              "entry_fee,mode,reason) VALUES('SPY','OPEN','2026-06-10T00:00:00+00:00',"
+              "10,500.0,5000.0,0.0,'sim','momentum rotation: top-K entry')")
+    c.execute("INSERT INTO etf_positions(symbol,status,opened_at,closed_at,qty,entry_price,"
+              "cost_usd,exit_price,realized_pnl_usd,mode,reason) VALUES('QQQ','CLOSED',"
+              "'2026-05-01T00:00:00+00:00','2026-06-01T00:00:00+00:00',12,400.0,4800.0,"
+              "410.0,120.0,'sim','rotation: out of top-K')")
+    # Carry: kill off + one OPEN delta-neutral BTC pair + one CLOSED ETH pair + funding.
+    c.execute("INSERT INTO carry_state(key,value) VALUES('carry_kill','0')")
+    c.execute("INSERT INTO carry_positions(asset,status,opened_at,spot_qty,spot_entry,perp_qty,"
+              "perp_entry,notional_usd,capital_usd,funding_accrued_usd,fees_usd,realized_pnl_usd,"
+              "low_reads,last_accrual_ts,mode,reason,perp_closed,spot_closed) VALUES('BTC','OPEN',"
+              "'2026-06-21T00:00:00+00:00',0.01,60000.0,0.01,60050.0,600.0,720.0,3.5,0.6,0.0,0,"
+              "0.0,'sim','net carry 14.2%/yr',0,0)")
+    c.execute("INSERT INTO carry_positions(asset,status,opened_at,closed_at,spot_qty,spot_entry,"
+              "perp_qty,perp_entry,notional_usd,capital_usd,funding_accrued_usd,fees_usd,"
+              "realized_pnl_usd,low_reads,mode,reason,perp_closed,spot_closed) VALUES('ETH','CLOSED',"
+              "'2026-05-10T00:00:00+00:00','2026-05-20T00:00:00+00:00',0.2,3000.0,0.2,3005.0,600.0,"
+              "720.0,12.0,0.5,12.0,3,'sim','carry decayed',1,1)")
+    c.executemany("INSERT INTO carry_funding(ts,asset,rate_apr,notional_usd,amount_usd) VALUES(?,?,?,?,?)",
+                  [("2026-06-21T01:00:00+00:00", "BTC", 0.142, 600.0, 1.4),
+                   ("2026-06-21T02:00:00+00:00", "BTC", 0.140, 600.0, 1.3),
+                   ("2026-06-22T01:00:00+00:00", "BTC", 0.138, 600.0, 0.8)])
+    c.commit()
+    c.close()

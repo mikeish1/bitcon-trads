@@ -286,3 +286,117 @@ class HealthStatus(_Base):
 
 class ApiError(_Base):
     error: dict[str, Any]
+
+
+# --------------------------------------------------------------------------- #
+# Sleeves (multi-strategy coverage: spot / carry / etf)                        #
+#                                                                             #
+# src/run_all.py runs up to three independent bots into the SAME SQLite file: #
+# the spot trend-follower (state/trades/decisions), the funding-carry bot     #
+# (carry_positions/carry_funding/carry_state), and the ETF momentum bot       #
+# (etf_positions/etf_state). The models below let the read-only dashboard     #
+# surface the carry and ETF sleeves it previously ignored. They are derived   #
+# purely from those tables + the audited CapitalSettingsService; no live      #
+# equity prices are required (ETF holdings are equities the crypto price feed  #
+# cannot quote, and carry pairs are delta-neutral), so the views degrade       #
+# gracefully rather than asserting numbers they cannot verify read-only.       #
+# --------------------------------------------------------------------------- #
+class SleeveCard(_Base):
+    """One headline tile per sleeve for the overview strip."""
+
+    key: str = Field(description="spot | carry | etf")
+    label: str
+    active: bool = Field(description="True once the sleeve has run (its tables/state exist)")
+    mode: Optional[str] = Field(description="PAPER/LIVE/SIM... from the sleeve's own rows; None if never run")
+    open_positions: int
+    primary_value_usd: Optional[float]
+    primary_label: str = Field(description="what primary_value_usd means, e.g. 'Equity' or 'Capital used'")
+    realized_pnl_usd: Optional[float] = Field(description="lifetime realized P&L from CLOSED positions")
+    capital_source: Optional[str] = Field(description="winning capital-limit source: env/override_file/yaml/legacy")
+    capital_description: Optional[str]
+    note: Optional[str] = None
+
+
+class SleevesOverview(_Base):
+    cards: list[SleeveCard]
+    as_of: datetime
+
+
+class EtfHolding(_Base):
+    id: int
+    symbol: str
+    opened_at: datetime
+    age_days: float
+    qty: float
+    entry_price: float
+    cost_usd: float
+    mode: str
+    reason: str
+    # ---- live-price fields are Optional: the dashboard's crypto price feed cannot
+    # quote equities, so these are null with price_is_stale=True for ETF symbols ----
+    last_price: Optional[float]
+    market_value: Optional[float]
+    unrealized_pnl_usd: Optional[float]
+    unrealized_pnl_pct: Optional[float]
+    price_is_stale: bool
+
+
+class EtfSleeve(_Base):
+    available: bool = Field(description="False until the ETF bot has created its tables")
+    mode: Optional[str]
+    priced: bool = Field(description="True if live prices were available for any holding (rare for equities)")
+    paper_cash: Optional[float]
+    holdings_cost_usd: float
+    holdings_market_value: Optional[float]
+    equity_estimate: Optional[float] = Field(description="paper_cash + holdings (market value if priced, else cost)")
+    realized_pnl_usd: float
+    open_positions: int
+    deployable_capital: Optional[float]
+    capital_source: Optional[str]
+    capital_description: Optional[str]
+    last_rebalance: Optional[str]
+    regime: Optional[str] = Field(description="dual-momentum regime label, when the selector emits one")
+    holdings: list[EtfHolding]
+    as_of: datetime
+
+
+class CarryPair(_Base):
+    id: int
+    asset: str
+    opened_at: datetime
+    age_hours: float
+    notional_usd: float
+    capital_usd: float
+    spot_qty: float
+    spot_entry: float
+    perp_qty: float
+    perp_entry: float
+    funding_accrued_usd: float = Field(description="funding income booked so far on this open pair (unrealized)")
+    low_reads: int = Field(description="consecutive polls below the hold threshold (unwind confirmation count)")
+    delta_drift_pct: float = Field(description="|spot_qty - perp_qty| / max(qty) * 100; >0 means legs drifted")
+    unwind_in_progress: bool = Field(description="exactly one leg closed (a resumable, half-done unwind)")
+    mode: str
+    reason: str
+
+
+class CarryFundingPoint(_Base):
+    day: str
+    amount_usd: float
+
+
+class CarrySleeve(_Base):
+    available: bool = Field(description="False until the carry bot has created its tables")
+    mode: Optional[str]
+    open_pairs_count: int
+    capital_used: float = Field(description="sum of capital_usd across OPEN pairs (spot + futures margin)")
+    deployable_capital: Optional[float]
+    capital_source: Optional[str]
+    capital_description: Optional[str]
+    funding_today_usd: float
+    funding_total_usd: float
+    realized_today_usd: float
+    realized_total_usd: float = Field(description="lifetime realized P&L on CLOSED pairs (includes their funding)")
+    kill_active: bool = Field(description="carry kill switch engaged (state flag)")
+    pairs: list[CarryPair]
+    funding_series: list[CarryFundingPoint] = Field(description="daily funding income for a small trend chart")
+    as_of: datetime

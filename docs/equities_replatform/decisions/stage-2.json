@@ -1,0 +1,61 @@
+{
+  "handoff": {
+    "step_id": "stage-2-data-mechanics",
+    "status": "success",
+    "confidence": 0.85,
+    "key_outputs": {
+      "R1_fixed": "AlpacaBroker.daily_bars now requests adjustment=ALL (split+dividend); default explicit via etf.alpaca_adjustment, ETF_ALPACA_ADJUSTMENT override; regression-tested",
+      "data_quality": "validate_bars() drops structural corruption (NaN/non-positive/high<low/dup-timestamps), flags gaps + OHLC quirks; wired into EtfData.frames with severity-graded logging",
+      "bias_audit_confidence": 0.85,
+      "selected_universe": {
+        "offensive": ["SPY", "EFA", "EEM", "(opt) QQQ"],
+        "defensive": ["TLT/IEF", "GLD", "BIL"]
+      },
+      "calendar": "Alpaca trading-day bars + is_market_open fail-closed clock (live); backtest steps real session dates",
+      "tests": "233 passed (was 221): +9 data-quality, +2 broker-adjustment",
+      "branch": "feat/etf-equities-replatform now correctly based on fix/etf-sleeve-hardening (2e3bb34); all ETF hardening present"
+    },
+    "assumptions": [
+      "taxable account (Stage-0 answer) -> tax surfacing weighted in Stage 4",
+      "today's broad-ETF basket is acceptable with the documented survivorship caveat",
+      "adjusted (back-adjusted) bars used consistently in backtest and live"
+    ],
+    "open_issues": [
+      "split-aware position reconcile deferred to Stage 3 (R8)",
+      "gap-at-open fill modeling deferred to Stage 4 (R6)",
+      "changes uncommitted; repo HEAD moved externally once this session"
+    ],
+    "artifacts": [
+      "src/etf/brokers/alpaca_broker.py",
+      "src/etf/config_etf.py",
+      "src/etf/data_quality.py",
+      "src/etf/data.py",
+      "tests/test_etf_data_quality.py",
+      "tests/test_etf_broker.py",
+      "docs/equities_replatform/data_bias_audit.md",
+      "docs/equities_replatform/decisions/stage-2.json"
+    ],
+    "verification_passed": true,
+    "next_focus": "Stage 3: scaffold + implement Dual Momentum (abs+rel + defensive sleeve), reconcile sizing with cap stack, split-aware reconcile, PDT guard, sim=backtest parity test, ADRs."
+  },
+  "judge": {
+    "overall_score": 8.7,
+    "decision": "pass",
+    "dimensions": {
+      "correctness": {"score": 9, "reasoning": "Adjusted-bars fix verified against Alpaca docs and regression-tested; data-quality rules unit-tested across happy/edge/fatal paths; full suite green (233)."},
+      "methodological_rigor": {"score": 9, "reasoning": "Look-ahead (causal indicators + closed-candle + point-in-time slicing), survivorship (role-based universe + honest caveat), and adjusted-data discipline each documented and, where testable, locked by tests."},
+      "robustness": {"score": 8, "reasoning": "Quality validator is conservative (drops only impossible rows, flags soft anomalies); gap-at-open correctly deferred to the Stage-4 cost model rather than hand-waved."},
+      "safety_compliance": {"score": 9, "reasoning": "Tripwire untouched; fail-closed clock; no-phantom-fill preserved; halts fail-safe; least-privilege data path; branch re-based onto the hardened foundation."},
+      "simplicity": {"score": 8, "reasoning": "Single small pure module + one config knob + minimal data.py wiring; no new dependencies."},
+      "clarity": {"score": 9, "reasoning": "Bias-audit note maps each bias class to its concrete mitigation and flags what is deferred and why."}
+    },
+    "issues_found": [
+      "Split-aware position reconcile still TODO (R8) -> Stage 3",
+      "Survivorship 'today's basket' caveat remains (mitigated, disclosed, not eliminated)"
+    ],
+    "suggested_revisions": [
+      "Proceed to Stage 3; carry R8 and the gap-at-open (R6) forward as planned"
+    ],
+    "confidence_in_judgment": 0.83
+  }
+}

@@ -148,11 +148,24 @@ class TradingBot:
             return
         logger.info("Universe ({}): {}", len(self.symbols), ", ".join(self.symbols))
 
-        # Startup reconcile (broker venues): close DB positions whose coins are gone.
+        # Startup reconcile (broker venues): close DB rows whose coins are gone AND
+        # adopt untracked holdings (orphaned fills from a crash) with a protective
+        # stop. Gather confirmed-close prices + ATRs so an adopted stop uses the
+        # chandelier rather than a tight default.
         try:
             balances = self.data.fetch_balances()
-            prices = self._all_prices()
-            self.risk.reconcile(balances, prices)
+            prices, atrs = {}, {}
+            for sym in self.symbols:
+                try:
+                    frames = self.data.signal_frames(self.data.get_frames(sym))
+                    last = frames[self.primary_tf].iloc[-1]
+                    prices[_base_of(sym)] = float(last["close"])
+                    if "atr" in last and last["atr"] == last["atr"]:
+                        atrs[_base_of(sym)] = float(last["atr"])
+                except Exception:
+                    pass
+            self.risk.reconcile(balances, prices, atrs,
+                                exit_resolver=self.executor.resolve_fill_price)
         except Exception as exc:
             logger.warning("Startup reconcile skipped: {}", exc)
 
@@ -187,17 +200,6 @@ class TradingBot:
                 return
             time.sleep(1)
 
-    def _all_prices(self) -> dict[str, float]:
-        """Latest price per base asset (best-effort; used for reconcile/equity)."""
-        prices: dict[str, float] = {}
-        for sym in getattr(self, "symbols", self.cfg["universe_symbols"]):
-            try:
-                frames = self.data.get_frames(sym)
-                prices[_base_of(sym)] = self.data.last_price(frames, self.primary_tf)
-            except Exception:
-                pass
-        return prices
-
     # ------------------------------------------------------------------ #
     def _cycle(self) -> None:
         # Pick up a changed deployable-capital limit without a restart (no-op if
@@ -217,7 +219,15 @@ class TradingBot:
             last = frames[self.primary_tf].iloc[-1]
             price = float(last["close"])
             atr = float(last["atr"]) if "atr" in last and last["atr"] == last["atr"] else 0.0
-            snap[sym] = {"frames": frames, "price": price, "atr": atr, "ts": last["timestamp"]}
+            # Closed-candle view for DECISIONS (breakout signal + trail ratchet). The
+            # live price/atr above stay for marking, sizing and the exit-breach check.
+            sig_frames = self.data.signal_frames(frames)
+            sig_last = sig_frames[self.primary_tf].iloc[-1]
+            sig_price = float(sig_last["close"])
+            sig_atr = (float(sig_last["atr"])
+                       if "atr" in sig_last and sig_last["atr"] == sig_last["atr"] else 0.0)
+            snap[sym] = {"frames": frames, "price": price, "atr": atr, "ts": last["timestamp"],
+                         "sig_frames": sig_frames, "sig_price": sig_price, "sig_atr": sig_atr}
             prices[_base_of(sym)] = price
 
         # Market regime: is BTC in an uptrend? (gates entries + forces risk-off exits)
@@ -226,7 +236,8 @@ class TradingBot:
         # Pass 2: manage open positions (now that regime is known).
         for sym, s in snap.items():
             if self.risk.open_position(sym) is not None:
-                self._manage(sym, s["price"], s["atr"], balances)
+                self._manage(sym, s["price"], s["atr"], balances,
+                             signal_price=s["sig_price"], signal_atr=s["sig_atr"])
 
         equity = self.risk.current_equity(balances, prices)
         avail_quote = self.risk.available_quote(balances)
@@ -278,7 +289,9 @@ class TradingBot:
                 if opened:
                     n_open += 1
                     open_value += opened
-                    avail_quote -= opened
+                    # Consume cost + estimated taker fee from in-cycle cash so a later
+                    # entry this cycle can't over-commit by the (small) fee drift.
+                    avail_quote -= opened * (1 + self.executor.fee_pct)
 
     # ------------------------------------------------------------------ #
     def _update_regime(self, snap: dict[str, dict]) -> None:
@@ -318,10 +331,11 @@ class TradingBot:
         if regime_factor <= 0:
             return 0.0  # market risk-off: no new entries
         ep = self.overrides.get(_base_of(sym), {}).get("entry_period")
+        sig_frames = s.get("sig_frames", s["frames"])      # confirmed-close view
         if self.strategy_mode == "donchian":
-            decision = self.strategy.decide(s["frames"], entry_period=ep)
+            decision = self.strategy.decide(sig_frames, entry_period=ep)
         else:
-            decision = self.strategy.decide(s["frames"])
+            decision = self.strategy.decide(sig_frames)
         self.risk.log_decision(sym, decision.action, decision.conviction,
                                decision.consulted_claude, decision.reasoning)
         if decision.action != "BUY":
@@ -352,13 +366,20 @@ class TradingBot:
         fill = self.executor.open_buy(sym, sizing["spend_usd"], price, intended_price=price)
         if fill is None:
             return 0.0
-        stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
-        stop_order_id = None
-        if self.use_exchange_stop:
-            stop_order_id = self.executor.place_stop_limit_sell(
-                sym, fill["qty"], stop0, self.risk.stop_limit_price(stop0))
-        self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, decision.reasoning,
-                              peak_price=fill["price"], entry_atr=s["atr"])
+        # The order is LIVE from here. Persist (+ protective stop) inside a guard so a
+        # crash/exception after the fill is loud and recoverable: the position is left
+        # for reconcile() to ADOPT next startup rather than running untracked.
+        try:
+            stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
+            stop_order_id = None
+            if self.use_exchange_stop:
+                stop_order_id = self.executor.place_protective_stop(sym, fill["qty"], stop0)
+            self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, decision.reasoning,
+                                  peak_price=fill["price"], entry_atr=s["atr"])
+        except Exception as exc:
+            logger.exception("{} FILLED but failed to record position: {}", sym, exc)
+            self.notifier.error(f"{sym} FILLED but NOT booked ({exc}); reconcile will adopt it.")
+            return fill.get("cost", 0.0)
         self._cb_notified = False
         self.notifier.entry(fill["price"], fill["qty"], fill["cost"], stop0, 0.0,
                             f"{sym}: {decision.reasoning}")
@@ -389,9 +410,10 @@ class TradingBot:
         active_frames: dict[str, dict] = {}
         for sym, s in snap.items():
             ep = self.overrides.get(_base_of(sym), {}).get("entry_period")
-            if self.strategy.active_state(s["frames"], entry_period=ep):
-                active_frames[sym] = s["frames"]
-        btc_frames = snap.get(f"BTC/{self._quote}", {}).get("frames")
+            sig_frames = s.get("sig_frames", s["frames"])    # confirmed-close view
+            if self.strategy.active_state(sig_frames, entry_period=ep):
+                active_frames[sym] = sig_frames
+        btc_frames = snap.get(f"BTC/{self._quote}", {}).get("sig_frames")
         cands = self.rotation.score_candidates(active_frames, btc_frames)
         # Cost-aware preference on the candidate scores: STRICT drops dear coins;
         # SOFT applies a small cost penalty as a tie-breaker (never overrides regime
@@ -431,7 +453,7 @@ class TradingBot:
             if opened:
                 n_open += 1
                 open_value += opened
-                avail_quote -= opened
+                avail_quote -= opened * (1 + self.executor.fee_pct)   # cost + est. taker fee
 
         self.risk.state_set("last_rotation_day", today)
 
@@ -456,21 +478,28 @@ class TradingBot:
         fill = self.executor.open_buy(sym, sizing["spend_usd"], price, intended_price=price)
         if fill is None:
             return 0.0
-        stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
-        stop_order_id = None
-        if self.use_exchange_stop:
-            stop_order_id = self.executor.place_stop_limit_sell(
-                sym, fill["qty"], stop0, self.risk.stop_limit_price(stop0))
         reason = f"momentum rotation: top-{self.rotation.top_k} entry"
-        self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, reason,
-                              peak_price=fill["price"], entry_atr=s["atr"])
-        self.risk.log_decision(sym, "BUY", 1, False, reason)
+        # Guard the post-fill persistence (see _try_enter): an orphaned fill is left
+        # for reconcile() to adopt rather than running with no stop/trail.
+        try:
+            stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
+            stop_order_id = None
+            if self.use_exchange_stop:
+                stop_order_id = self.executor.place_protective_stop(sym, fill["qty"], stop0)
+            self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, reason,
+                                  peak_price=fill["price"], entry_atr=s["atr"])
+            self.risk.log_decision(sym, "BUY", 1, False, reason)
+        except Exception as exc:
+            logger.exception("{} FILLED but failed to record rotation position: {}", sym, exc)
+            self.notifier.error(f"{sym} FILLED but NOT booked ({exc}); reconcile will adopt it.")
+            return fill.get("cost", 0.0)
         self._cb_notified = False
         self.notifier.entry(fill["price"], fill["qty"], fill["cost"], stop0, 0.0, f"{sym}: {reason}")
         return fill["cost"]
 
     # ------------------------------------------------------------------ #
-    def _manage(self, sym: str, price: float, atr: float, balances: dict[str, float]) -> None:
+    def _manage(self, sym: str, price: float, atr: float, balances: dict[str, float],
+                signal_price: float | None = None, signal_atr: float | None = None) -> None:
         pos = self.risk.open_position(sym)
         if pos is None:
             return
@@ -478,8 +507,12 @@ class TradingBot:
         if self.cfg["runtime"]["uses_broker"]:
             dust = self.cfg["risk"]["min_notional_usd"] / price if price else 0
             if balances.get(base, 0.0) < dust and pos["qty"] > dust:
-                self.risk.record_close(pos, pos["current_stop"] or price, 0.0, "exchange stop filled")
-                self.notifier.exit(pos["current_stop"] or price, 0.0, f"{sym}: exchange stop filled")
+                # Stop filled offline: book the venue's ACTUAL fill when resolvable,
+                # else a conservative estimate so the loss isn't under-counted.
+                est = self.risk.offline_exit_estimate(pos, price)
+                exit_px = self.executor.resolve_fill_price(sym, pos["stop_order_id"], est)
+                self.risk.record_close(pos, exit_px, 0.0, "exchange stop filled")
+                self.notifier.exit(exit_px, 0.0, f"{sym}: exchange stop filled")
                 return
 
         # Market risk-off -> flatten (legacy default) unless configured to hold+tighten.
@@ -512,9 +545,15 @@ class TradingBot:
             tm = float(self.regime_tighten_trail)
             trail_mult = tm if trail_mult is None else min(trail_mult, tm)
 
+        # Ratchet peak + chandelier off the CONFIRMED close/ATR (no intrabar-wick
+        # ratchet that the close-based backtest never sees); the live `price` is still
+        # used for the exit-breach check below, so genuine intraday breaks still exit.
+        trail_price = signal_price if signal_price is not None else price
+        trail_atr = signal_atr if signal_atr is not None else atr
         prev_stop = pos["current_stop"] or pos["stop_price"]
-        peak = max(pos["peak_price"] or pos["entry_price"], price)
-        new_stop = self.risk.chandelier_stop(peak, atr, mult=trail_mult) if atr > 0 else prev_stop
+        peak = max(pos["peak_price"] or pos["entry_price"], trail_price)
+        new_stop = (self.risk.chandelier_stop(peak, trail_atr, mult=trail_mult)
+                    if trail_atr > 0 else prev_stop)
         current_stop = max(prev_stop, new_stop)
         if breakeven_floor is not None:                 # lock in BE+buffer once armed
             current_stop = max(current_stop, breakeven_floor)
@@ -523,8 +562,7 @@ class TradingBot:
         if (self.cfg["runtime"]["place_orders"] and self.use_exchange_stop
                 and (scaled or current_stop > prev_stop * 1.001)):
             self.executor.cancel(sym, pos["stop_order_id"])
-            sid = self.executor.place_stop_limit_sell(
-                sym, pos["qty"], current_stop, self.risk.stop_limit_price(current_stop))
+            sid = self.executor.place_protective_stop(sym, pos["qty"], current_stop)
             if current_stop > prev_stop * 1.001:
                 logger.info("{} chandelier raised {:.4f} -> {:.4f}", sym, prev_stop, current_stop)
         self.risk.update_trail(pos["id"], peak, current_stop, sid)

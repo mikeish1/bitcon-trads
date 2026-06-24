@@ -1,0 +1,45 @@
+{
+  "stage_5_handoff": {
+    "step_id": "stage-5-paper-deploy",
+    "status": "success",
+    "confidence": 0.85,
+    "key_outputs": {
+      "deploy": "static_allocation runs on Alpaca paper via existing tiers (ETF_EXECUTION_MODE=live + ALPACA_PAPER=true = real paper orders); single-replica worker; market-hours guard; PDT guard",
+      "monitoring": "Telegram alerts on TRIM/ADD/reconcile/error; daily_stats logs; weekly equity reconcile. Few messages by design (quarterly cadence).",
+      "kill_switch": "soft (ETF_EXECUTION_MODE=sim) / hard (pause worker) / emergency manual sell / revoke key - in runbook.md",
+      "acceptance_criteria": ">=6 weeks, >=1 rebalance, holdings track 40/40/20, zero errors, live matches backtest (shared rebalance_deltas), account/equity agree",
+      "r3_closed": "live _rebalance_static and backtest simulate_static now call the SAME pure rebalance_deltas -> no dual-codepath drift for the deployed design"
+    },
+    "artifacts": ["docs/equities_replatform/runbook.md", "src/etf/static_allocation.py (rebalance_deltas)"],
+    "verification_passed": true,
+    "next_focus": "Stage 6 go-live readiness package (produce, do not enable)."
+  },
+  "stage_6_handoff": {
+    "step_id": "stage-6-go-live-readiness",
+    "status": "success",
+    "confidence": 0.86,
+    "key_outputs": {
+      "package": "go_live_readiness.md: review-validation + paper-first + Alpaca no-withdrawal keys + tiny-size $100-250 first month + two-key flip + kill-switch drill + house-money 2x withdrawal + taxable tax note + honest framing",
+      "stance": "agent does NOT flip switches; going live is the human's decision and risk; no profit guaranteed; built for lower drawdown not beating a bull",
+      "tax_note": "tax-efficient by design (quarterly + drift band -> few sales, ~100% long-term gains in backtest); wash-sale unlikely; consider tax-advantaged account"
+    },
+    "artifacts": ["docs/equities_replatform/go_live_readiness.md"],
+    "verification_passed": true,
+    "next_focus": "STOP. Human decides paper run, then (separately) whether to ever go live."
+  },
+  "judge": {
+    "overall_score": 8.7,
+    "decision": "pass",
+    "dimensions": {
+      "correctness": {"score": 9, "reasoning": "Deploy tiers + tripwire reflect the actual config_etf logic and tests; R3 closed for the static path via the shared pure decision (262 tests green)."},
+      "methodological_rigor": {"score": 8, "reasoning": "Acceptance criteria tie paper to the backtest via the shared decision function; honest about the favorable OOS window."},
+      "robustness": {"score": 8, "reasoning": "Kill-switch tiers + single-replica + market-hours + PDT + no-withdrawal keys; quiet-by-design monitoring expectations set."},
+      "safety_compliance": {"score": 10, "reasoning": "Paper-first; two-key tripwire never weakened; agent does not enable live; explicit human-decision-and-risk framing; no-withdrawal keys emphasized."},
+      "simplicity": {"score": 9, "reasoning": "Reuses existing deploy/tripwire/notifier infra; the sleeve itself is a 3-line weight map."},
+      "clarity": {"score": 9, "reasoning": "Runbook + checklist are step-by-step, with the kill-switch drill and tax note concrete."}
+    },
+    "issues_found": ["Paper run + go-live are human actions not yet taken (by design)"],
+    "suggested_revisions": ["Human: run >=6wk paper per runbook, then decide on live separately"],
+    "confidence_in_judgment": 0.85
+  }
+}

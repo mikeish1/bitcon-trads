@@ -23,6 +23,15 @@ export const useRisk = () =>
 export const useHealth = () =>
   useQuery({ queryKey: qk.health, queryFn: api.health, refetchInterval: MED });
 
+export const useSleeves = () =>
+  useQuery({ queryKey: qk.sleeves, queryFn: api.sleeves, refetchInterval: MED });
+
+export const useEtfSleeve = () =>
+  useQuery({ queryKey: qk.etfSleeve, queryFn: api.etfSleeve, refetchInterval: MED });
+
+export const useCarrySleeve = () =>
+  useQuery({ queryKey: qk.carrySleeve, queryFn: api.carrySleeve, refetchInterval: MED });
+
 export const useConfig = () =>
   useQuery({ queryKey: qk.config, queryFn: api.config, staleTime: 5 * 60_000 });
 

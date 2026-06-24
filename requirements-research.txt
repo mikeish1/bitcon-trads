@@ -1,0 +1,4 @@
+# Research-only dependencies for the Stage-4 ETF validation harness
+# (src/etf/research/). NOT needed by the live bot, which fetches from Alpaca.
+#   pip install -r requirements-research.txt
+yfinance>=0.2.40

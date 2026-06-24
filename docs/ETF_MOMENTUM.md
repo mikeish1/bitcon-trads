@@ -101,7 +101,15 @@ closed (fail-closed if the clock can't be read). Non-Alpaca venues fall back to
 ## 7. Recommended follow-ups
 1. Daily chandelier stop between rebalances (reuse the crypto risk trail) for
    tighter downside control.
-2. Absolute-momentum / cash filter (Antonacci dual momentum): go to cash (or
-   short-bond ETF) when the leader's own momentum is negative.
+2. ~~Absolute-momentum / cash filter (Antonacci dual momentum)~~ — **done** as a
+   selector mode: set `etf.selection.mode: dual_momentum` (or `ETF_SELECTION_MODE`).
+   Holds the strongest offensive ETF only while its absolute momentum beats a T-bill
+   hurdle, else rotates to the strongest of a defensive sleeve (bonds/gold/T-bills).
+   Off by default; validate before enabling. See
+   [docs/equities_replatform/](equities_replatform/) (strategy survey, ADRs, bias audit).
 3. Vol-targeted weights instead of pure equal-weight.
 4. ~~A live equities adapter via `alpaca-py`~~ — **done** (`AlpacaBroker`, §6).
+
+> Bars are **split+dividend adjusted** (`etf.alpaca_adjustment: all`) and pass a
+> data-quality check (`src/etf/data_quality.py`) before indicators. A PDT same-day
+> guard (`etf.pdt_guard`) and split-aware reconcile keep the live path safe.

@@ -1,0 +1,353 @@
+"""Regression tests for the three live-execution-integrity fixes:
+
+  C1 - executor never books a 0/None fill as a full fill (no phantom positions).
+  C2 - reconcile() adopts an untracked broker holding (orphaned fill) WITH a stop,
+       and still closes coins that have left the account.
+  H1 - signal decisions use the last CONFIRMED-closed daily bar, not the forming one.
+"""
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+from src.data_pipeline import DataPipeline
+from src.executor import SpotExecutor
+from src.risk_manager import RiskManager
+from src.strategy import DonchianStrategy
+
+
+# --------------------------------------------------------------------------- #
+# C1: zero / partial / unknown fills                                          #
+# --------------------------------------------------------------------------- #
+def _exec_cfg(db_path):
+    return {
+        "runtime": {"place_orders": True, "real_money": False, "db_path": db_path},
+        "execution": {"taker_fee_pct": 0.001, "maker_fee_pct": 0.001,
+                      "paper_slippage_pct": 0.0007, "use_limit_orders_on_entry": False,
+                      "slippage_logging_enabled": False, "max_slippage_tolerance_bps": 50},
+        "risk": {"min_notional_usd": 10.0},
+    }
+
+
+class FillExchange:
+    """ccxt-like stub whose market orders report a configurable fill."""
+    def __init__(self, filled, status="closed", refetch_filled="unset"):
+        self.filled = filled
+        self.status = status
+        self.refetch_filled = refetch_filled
+
+    def amount_to_precision(self, s, q): return float(q)
+    def price_to_precision(self, s, p): return float(p)
+    def market(self, s): return {"limits": {"cost": {"min": None}}}
+
+    def _order(self, oid):
+        cost = None if self.filled is None else self.filled * 100.0
+        return {"id": oid, "filled": self.filled, "status": self.status,
+                "cost": cost, "average": 100.0}
+
+    def create_market_buy_order(self, symbol, qty): return self._order("b1")
+    def create_market_sell_order(self, symbol, qty): return self._order("s1")
+
+    def fetch_order(self, oid, symbol):
+        f = None if self.refetch_filled == "unset" else self.refetch_filled
+        return {"id": oid, "filled": f, "status": self.status, "cost": None, "average": 100.0}
+
+
+def test_buy_zero_fill_books_no_position(tmp_path):
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")), exchange=FillExchange(filled=0))
+    assert ex.market_buy("BTC/USD", 1000.0, 100.0, intended_price=100.0) is None
+
+
+def test_buy_partial_fill_reports_actual_qty(tmp_path):
+    # requested 10 units; venue fills only 4 -> we must book 4, never 10.
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")), exchange=FillExchange(filled=4.0))
+    fill = ex.market_buy("BTC/USD", 1000.0, 100.0, intended_price=100.0)
+    assert fill is not None and fill["qty"] == pytest.approx(4.0)
+    assert fill["cost"] == pytest.approx(400.0)
+
+
+def test_buy_unknown_fill_resolved_zero_books_nothing(tmp_path):
+    # filled=None at first; a re-fetch confirms 0 -> no position.
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")),
+                      exchange=FillExchange(filled=None, status="open", refetch_filled=0.0))
+    assert ex.market_buy("BTC/USD", 1000.0, 100.0, intended_price=100.0) is None
+
+
+def test_sell_zero_fill_keeps_position_open(tmp_path):
+    # A rejected exit must NOT return a fill (else the DB would mark it CLOSED).
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")), exchange=FillExchange(filled=0))
+    assert ex.market_sell("BTC/USD", 5.0, 100.0, "exit", intended_price=100.0) is None
+
+
+# --------------------------------------------------------------------------- #
+# C2: reconcile adoption + closing                                            #
+# --------------------------------------------------------------------------- #
+def _risk_cfg(adopt=True):
+    return {
+        "runtime": {"uses_broker": True, "real_money": False, "db_path": ":memory:"},
+        "risk": {"default_capital_usd": 10_000.0, "risk_per_trade_pct": 0.01,
+                 "max_position_pct": 0.95, "min_notional_usd": 10.0,
+                 "kelly_fraction": 0.25, "kelly_assumed_payoff": 2.0},
+        "safety": {"daily_loss_limit_pct": 0.03, "weekly_loss_limit_pct": 0.07,
+                   "max_consecutive_losses": 4, "cooldown_minutes": 60, "max_trades_per_day": 4},
+        "exits": {"atr_stop_mult": 2.0, "min_stop_pct": 0.01, "atr_trail_mult": 2.5,
+                  "take_profit_R": 3.0, "stop_limit_offset_pct": 0.003},
+        "portfolio": {"max_concurrent_positions": 3, "max_total_exposure_pct": 0.90,
+                      "per_asset_alloc_pct": 0.30},
+        "strategy": {"donchian": {"atr_trail_mult": 3.0}, "vol_target": {"enabled": False}},
+        "quote_ccy": "USD",
+        "universe_symbols": ["BTC/USD", "ETH/USD"],
+        "reconcile": {"adopt_orphans": adopt},
+    }
+
+
+def test_reconcile_adopts_orphaned_holding_with_stop():
+    rm = RiskManager(_risk_cfg())
+    # Account holds 0.5 BTC the DB never recorded (orphaned fill); USD cash too.
+    rm.reconcile({"BTC": 0.5, "USD": 1000.0}, {"BTC": 100.0}, atrs={"BTC": 3.0})
+    pos = rm.open_position("BTC/USD")
+    assert pos is not None
+    assert pos["qty"] == pytest.approx(0.5)
+    assert pos["entry_price"] == pytest.approx(100.0)
+    # Protective chandelier stop = price - 3.0*ATR (donchian atr_trail_mult=3.0).
+    assert pos["current_stop"] == pytest.approx(91.0)
+    assert "adopted" in (pos["reason"] or "")
+
+
+def test_reconcile_ignores_coins_outside_universe():
+    rm = RiskManager(_risk_cfg())
+    rm.reconcile({"DOGE": 1000.0, "USD": 50.0}, {"DOGE": 0.1}, atrs={})
+    assert rm.open_positions() == []     # DOGE not in universe -> never adopted
+
+
+def test_reconcile_adoption_can_be_disabled():
+    rm = RiskManager(_risk_cfg(adopt=False))
+    rm.reconcile({"BTC": 0.5, "USD": 1000.0}, {"BTC": 100.0}, atrs={"BTC": 3.0})
+    assert rm.open_positions() == []
+
+
+def test_reconcile_closes_coin_gone_from_account():
+    rm = RiskManager(_risk_cfg())
+    rm.record_open("BTC/USD", {"price": 100.0, "qty": 0.5, "cost": 50.0, "fee": 0.0},
+                   95.0, 0.0, None, "test", peak_price=100.0, entry_atr=3.0)
+    # BTC no longer in the account -> the stop filled offline; close the stale row.
+    rm.reconcile({"USD": 1000.0}, {"BTC": 100.0}, atrs={"BTC": 3.0})
+    assert rm.open_position("BTC/USD") is None
+    row = rm.conn.execute("SELECT status FROM trades WHERE symbol='BTC/USD'").fetchone()
+    assert row["status"] == "CLOSED"
+
+
+# --------------------------------------------------------------------------- #
+# H1: closed-candle signalling                                                #
+# --------------------------------------------------------------------------- #
+class TFExchange:
+    """Minimal exchange exposing the timeframe helpers signal_frames needs."""
+    def __init__(self, now_ms): self._now = now_ms
+    def parse_timeframe(self, tf): return 86400          # seconds in 1d
+    def milliseconds(self): return self._now
+
+
+def _daily_df(n, last_open: pd.Timestamp):
+    ts = [last_open - pd.Timedelta(days=(n - 1 - i)) for i in range(n)]
+    return pd.DataFrame({"timestamp": ts, "open": 100.0, "high": 110.0,
+                         "low": 90.0, "close": 100.0, "volume": 1.0, "atr": 2.0})
+
+
+def _pipeline(now_ms):
+    cfg = {"market": {"primary_timeframe": "1d", "confirm_timeframes": [],
+                      "backfill_candles": 400, "signal_on_closed_candle": True},
+           "quote_ccy": "USD"}
+    return DataPipeline(cfg, TFExchange(now_ms))
+
+
+def test_is_bar_forming_detects_open_bar():
+    now = pd.Timestamp("2026-06-23 12:00", tz="UTC")
+    dp = _pipeline(int(now.value // 1_000_000))
+    today = pd.Timestamp("2026-06-23 00:00", tz="UTC")
+    yesterday = pd.Timestamp("2026-06-22 00:00", tz="UTC")
+    assert dp.is_bar_forming(_daily_df(5, today), "1d") is True       # last bar still open
+    assert dp.is_bar_forming(_daily_df(5, yesterday), "1d") is False  # last bar closed
+
+
+def test_signal_frames_drops_forming_bar():
+    now = pd.Timestamp("2026-06-23 12:00", tz="UTC")
+    dp = _pipeline(int(now.value // 1_000_000))
+    df = _daily_df(60, pd.Timestamp("2026-06-23 00:00", tz="UTC"))    # last bar forming
+    out = dp.signal_frames({"1d": df})
+    assert len(out["1d"]) == len(df) - 1                              # forming bar dropped
+    # Off -> no truncation.
+    dp.cfg["market"]["signal_on_closed_candle"] = False
+    assert len(dp.signal_frames({"1d": df})["1d"]) == len(df)
+
+
+def test_donchian_does_not_fire_on_forming_bar_breakout():
+    """A breakout that exists only on the still-forming bar must NOT trigger once the
+    forming bar is dropped - this is the whole point of closed-candle signalling."""
+    cfg = {"market": {"primary_timeframe": "1d"},
+           "strategy": {"donchian": {"entry_period": 40, "min_history": 60, "atr_trail_mult": 3.0}}}
+    strat = DonchianStrategy(cfg)
+    df = _daily_df(65, pd.Timestamp("2026-06-23 00:00", tz="UTC"))
+    df.loc[df.index[-1], "close"] = 115.0     # forming bar pokes above the 110 prior high
+    df.loc[df.index[-2], "close"] = 105.0     # last CONFIRMED close did NOT break out
+
+    # Raw frames (forming bar last) -> false breakout fires (documents the bug).
+    assert strat.decide({"1d": df}).action == "BUY"
+    # Confirmed-close view (forming bar dropped) -> correctly FLAT (the fix).
+    assert strat.decide({"1d": df.iloc[:-1].reset_index(drop=True)}).action == "FLAT"
+
+
+# --------------------------------------------------------------------------- #
+# H2: offline protective stop is a STOP-MARKET (gap-safe) by default          #
+# --------------------------------------------------------------------------- #
+class StopExchange:
+    """Captures create_order calls; can reject stop-market to test the fallback."""
+    def __init__(self, reject_market=False):
+        self.reject_market = reject_market
+        self.orders = []
+
+    def amount_to_precision(self, s, q): return float(q)
+    def price_to_precision(self, s, p): return round(float(p), 2)
+
+    def create_order(self, symbol, otype, side, qty, price, params):
+        if otype == "market" and self.reject_market:
+            raise Exception("stop-market not supported on this venue")
+        self.orders.append({"type": otype, "side": side, "qty": qty,
+                            "price": price, "params": params})
+        return {"id": f"{otype}-1"}
+
+
+def _stops_cfg(db_path, stop_type=None):
+    cfg = _exec_cfg(db_path)
+    if stop_type is not None:
+        cfg["exits"] = {"stop_order_type": stop_type, "stop_limit_offset_pct": 0.003}
+    return cfg
+
+
+def test_protective_stop_defaults_to_market(tmp_path):
+    fx = StopExchange()
+    ex = SpotExecutor(_stops_cfg(str(tmp_path / "t.db")), exchange=fx)   # no exits -> market
+    assert ex.place_protective_stop("BTC/USD", 1.0, 90.0) == "market-1"
+    o = fx.orders[-1]
+    assert o["type"] == "market" and o["price"] is None                 # market, no limit band
+    assert o["params"]["stopPrice"] == pytest.approx(90.0)
+
+
+def test_protective_stop_limit_mode_uses_band(tmp_path):
+    fx = StopExchange()
+    ex = SpotExecutor(_stops_cfg(str(tmp_path / "t.db"), "limit"), exchange=fx)
+    assert ex.place_protective_stop("BTC/USD", 1.0, 100.0) == "limit-1"
+    o = fx.orders[-1]
+    assert o["type"] == "limit"
+    assert o["price"] == pytest.approx(99.7)                            # 100 * (1 - 0.003)
+    assert o["params"]["stopPrice"] == pytest.approx(100.0)
+
+
+def test_protective_stop_market_rejection_falls_back_to_limit(tmp_path):
+    fx = StopExchange(reject_market=True)
+    ex = SpotExecutor(_stops_cfg(str(tmp_path / "t.db")), exchange=fx)   # market default
+    assert ex.place_protective_stop("BTC/USD", 1.0, 100.0) == "limit-1"
+    assert fx.orders[-1]["type"] == "limit"                             # fell back, still protected
+
+
+def test_protective_stop_sim_returns_sim_id(tmp_path):
+    cfg = _stops_cfg(str(tmp_path / "t.db"))
+    cfg["runtime"]["place_orders"] = False
+    ex = SpotExecutor(cfg, exchange=StopExchange())
+    assert ex.place_protective_stop("BTC/USD", 1.0, 90.0).startswith("sim-stop-")
+
+
+# --------------------------------------------------------------------------- #
+# M1: offline-stop close books a conservative / actual exit, not the trigger   #
+# --------------------------------------------------------------------------- #
+def _open_btc(rm, qty=1.0, cost=100.0, stop=95.0, oid=None):
+    rm.record_open("BTC/USD", {"price": 100.0, "qty": qty, "cost": cost, "fee": 0.0},
+                   stop, 0.0, oid, "t", peak_price=100.0, entry_atr=3.0)
+    return rm.open_position("BTC/USD")
+
+
+def test_offline_exit_estimate_takes_worse_of_trigger_and_mark():
+    rm = RiskManager(_risk_cfg())
+    pos = _open_btc(rm)                                   # trigger 95
+    assert rm.offline_exit_estimate(pos, 90.0) == pytest.approx(90.0)   # mark below trigger
+    assert rm.offline_exit_estimate(pos, 99.0) == pytest.approx(95.0)   # trigger bounds it
+
+
+def test_offline_exit_estimate_applies_gap_haircut():
+    cfg = _risk_cfg()
+    cfg["exits"]["offline_stop_slippage_pct"] = 0.01
+    rm = RiskManager(cfg)
+    pos = _open_btc(rm)
+    assert rm.offline_exit_estimate(pos, 90.0) == pytest.approx(90.0 * 0.99)
+
+
+def test_reconcile_close_books_conservative_loss_when_mark_below_stop():
+    rm = RiskManager(_risk_cfg())
+    _open_btc(rm, qty=1.0, cost=100.0, stop=95.0)
+    # Gap-down: coin gone, last mark 80 (below the 95 trigger) -> book at 80, not 95,
+    # so the loss the safety rails see is the real -20, not an understated -5.
+    rm.reconcile({"USD": 1000.0}, {"BTC": 80.0}, atrs={"BTC": 3.0})
+    row = rm.conn.execute(
+        "SELECT exit_price, pnl_usd FROM trades WHERE symbol='BTC/USD'").fetchone()
+    assert row["exit_price"] == pytest.approx(80.0)
+    assert row["pnl_usd"] == pytest.approx(-20.0)
+
+
+def test_reconcile_uses_exit_resolver_for_actual_fill():
+    rm = RiskManager(_risk_cfg())
+    _open_btc(rm, qty=1.0, cost=100.0, stop=95.0, oid="stopid")
+    # The venue can tell us the real offline fill (92) -> use it over the estimate.
+    rm.reconcile({"USD": 1000.0}, {"BTC": 90.0}, atrs={"BTC": 3.0},
+                 exit_resolver=lambda sym, oid, fb: 92.0)
+    row = rm.conn.execute("SELECT exit_price FROM trades WHERE symbol='BTC/USD'").fetchone()
+    assert row["exit_price"] == pytest.approx(92.0)
+
+
+def test_resolve_fill_price_prefers_venue_average(tmp_path):
+    class Ex:
+        def fetch_order(self, oid, sym): return {"average": 91.5, "filled": 1.0}
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")), exchange=Ex())   # place=True
+    assert ex.resolve_fill_price("BTC/USD", "oid", 88.0) == pytest.approx(91.5)
+
+
+def test_resolve_fill_price_falls_back_without_id(tmp_path):
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")), exchange=None)
+    assert ex.resolve_fill_price("BTC/USD", None, 88.0) == pytest.approx(88.0)
+
+
+# --------------------------------------------------------------------------- #
+# M2: fee normalized to the quote currency                                     #
+# --------------------------------------------------------------------------- #
+def _fee_exec(tmp_path):
+    cfg = _exec_cfg(str(tmp_path / "t.db"))
+    cfg["runtime"]["place_orders"] = False        # offline -> no ticker conversion
+    return SpotExecutor(cfg, exchange=None)
+
+
+def test_fee_in_quote_currency_passthrough(tmp_path):
+    ex = _fee_exec(tmp_path)
+    assert ex._extract_fee({"fee": {"cost": 1.25, "currency": "USD"}},
+                           "BTC/USD", 100.0) == pytest.approx(1.25)
+
+
+def test_fee_in_base_currency_converted_via_fill_price(tmp_path):
+    ex = _fee_exec(tmp_path)
+    # 0.001 BTC fee at a 50k fill -> $50, NOT 0.001 booked as dollars.
+    assert ex._extract_fee({"fee": {"cost": 0.001, "currency": "BTC"}},
+                           "BTC/USD", 50_000.0) == pytest.approx(50.0)
+
+
+def test_fee_missing_is_zero(tmp_path):
+    assert _fee_exec(tmp_path)._extract_fee({}, "BTC/USD", 100.0) == 0.0
+
+
+def test_fee_list_mixed_currencies_summed(tmp_path):
+    ex = _fee_exec(tmp_path)
+    order = {"fees": [{"cost": 0.5, "currency": "USD"},
+                      {"cost": 0.002, "currency": "BTC"}]}     # 0.5 + 0.002*100
+    assert ex._extract_fee(order, "BTC/USD", 100.0) == pytest.approx(0.7)
+
+
+def test_fee_unknown_token_falls_back_to_raw_cost_offline(tmp_path):
+    ex = _fee_exec(tmp_path)                                   # offline -> no ticker
+    assert ex._extract_fee({"fee": {"cost": 0.5, "currency": "BNB"}},
+                           "BTC/USD", 100.0) == pytest.approx(0.5)

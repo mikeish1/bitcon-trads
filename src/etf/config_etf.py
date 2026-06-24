@@ -46,6 +46,47 @@ def load_etf_config() -> dict[str, Any]:
     sel.setdefault("rebalance_days", 5)
     sel.setdefault("lookback_days", 90)
     sel.setdefault("keep_band", 1)
+    # Selector: "rotation" (Donchian-gated top-K, original) | "dual_momentum" (GEM).
+    sel["mode"] = os.getenv("ETF_SELECTION_MODE", sel.get("mode", "rotation")).strip().lower()
+
+    # --- Dual-momentum (Antonacci GEM-style) parameters (mode: dual_momentum) ----
+    # Absolute + relative momentum across an OFFENSIVE basket with a DEFENSIVE sleeve
+    # fallback. Few-parameter, low-turnover (tax-friendly). Off unless mode selects it.
+    # See docs/equities_replatform/strategy_options.md + data_bias_audit.md.
+    dm = e.setdefault("dual_momentum", {})
+    dm.setdefault("offensive", ["SPY", "EFA", "EEM"])
+    dm.setdefault("defensive", ["TLT", "IEF", "GLD", "BIL"])
+    dm.setdefault("abs_benchmark", "BIL")     # T-bill proxy = the absolute hurdle ("" -> 0.0)
+    dm.setdefault("lookback_days", 252)       # ~12-month momentum (abs + rel share it)
+    dm.setdefault("top_k", 1)                 # GEM classic = hold the single strongest
+    dm.setdefault("rebalance_days", 20)       # ~monthly cadence
+    dm.setdefault("keep_band", 0)             # rank hysteresis
+    dm.setdefault("min_history", 260)         # need >= lookback + buffer bars
+
+    # Pattern-Day-Trader guard: never round-trip a symbol the same day it was opened
+    # (the design holds multi-day/weekly, so this only blocks accidental same-day
+    # exits). Keeps a <$25k margin account clear of the 3-day-trades/5-day rule.
+    e["pdt_guard"] = _env_bool("ETF_PDT_GUARD", bool(e.get("pdt_guard", True)))
+
+    # --- Static fixed-weight allocation (mode: static_allocation) ----------------
+    # The Stage-4-VALIDATED ETF sleeve: a diversified buy-and-hold-rebalance blend
+    # (default 40% SPY / 40% AGG / 20% GLD). Drift-band + slow clock keep turnover
+    # (and taxable realization) minimal. See docs/equities_replatform/validation_report.md.
+    sa = e.setdefault("static_allocation", {})
+    sa.setdefault("weights", {"SPY": 0.40, "AGG": 0.40, "GLD": 0.20})
+    sa.setdefault("rebalance_days", 63)       # ~quarterly
+    sa.setdefault("drift_band", 0.05)         # only trade a symbol drifted > +/-5% of equity
+
+    # The tradable universe follows the selected mode's symbols (unless ETF_UNIVERSE
+    # was set explicitly).
+    if not uni_env and sel["mode"] == "dual_momentum":
+        seen: list[str] = []
+        for s in [*dm["offensive"], *dm["defensive"]]:
+            if s.upper() not in seen:
+                seen.append(s.upper())
+        e["universe"] = seen
+    elif not uni_env and sel["mode"] == "static_allocation":
+        e["universe"] = [str(s).upper() for s in sa["weights"]]
 
     cap = e.setdefault("capital", {})
     cap["sleeve_usd"] = _env_float("ETF_SLEEVE_USD", cap.get("sleeve_usd", 2000.0))
@@ -53,6 +94,10 @@ def load_etf_config() -> dict[str, Any]:
     cap.setdefault("min_notional_usd", 10.0)
 
     e.setdefault("alpaca_feed", "iex")             # free Alpaca data uses the IEX feed
+    # Split- AND dividend-adjust bars by default. RAW (unadjusted) bars would inject
+    # phantom split/ex-div gaps that fire false trend exits - see data_bias_audit.md.
+    e["alpaca_adjustment"] = os.getenv(
+        "ETF_ALPACA_ADJUSTMENT", str(e.get("alpaca_adjustment", "all"))).strip().lower()
 
     ex = e.setdefault("execution", {})
     mode = os.getenv("ETF_EXECUTION_MODE", ex.get("mode", "sim")).strip().lower()

@@ -440,6 +440,16 @@ Config: the `etf:` block of `config/trading_config.yaml` (overrides via `ETF_*`)
 orders on Alpaca (real money also needs the two-key tripwire + `ALPACA_PAPER=false`).
 Full design + the live tiers: **[docs/ETF_MOMENTUM.md](docs/ETF_MOMENTUM.md)**.
 
+> **Validated design (`selection.mode`):** a staged, judge-gated re-platform for a
+> small **taxable** account found that momentum (rotation / dual-momentum) does **not**
+> beat passive after cost and tax out-of-sample, while a simple **static 40/40/20
+> SPY/AGG/GLD** sleeve (`selection.mode: static_allocation`) does — Sharpe ~0.90
+> (OOS 1.09), max drawdown ~21%, long-term-gains-only tax. It is **off by default**
+> (mode stays `rotation`). Full plan, strategy survey, bias audit, realistic
+> validation report, ADRs, runbook, and go-live package:
+> **[docs/equities_replatform/](docs/equities_replatform/)**. Research harness deps:
+> `pip install -r requirements-research.txt` (yfinance; research-only).
+
 ## FAQ
 
 **Why does it almost never trade?** That's the point — it only takes
