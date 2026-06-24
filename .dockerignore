@@ -17,3 +17,14 @@ env/
 *.log
 .DS_Store
 README.md
+
+# Node (frontend): never copy the local install/build into the context. The image
+# builds the SPA fresh on Linux in the Node stage (local node_modules has Windows
+# binaries and is hundreds of MB).
+node_modules/
+web/frontend/dist/
+
+# Local research output + tests (not needed at runtime; regenerate anytime).
+backtests/
+.pytest_cache/
+tests/
