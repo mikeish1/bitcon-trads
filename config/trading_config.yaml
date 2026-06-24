@@ -294,8 +294,16 @@ exits:
                               #    on the small 5m ATR). This usually dominates.
   atr_trail_mult: 2.5         # trailing stop = price - 2.5 * ATR (ratchets up only)
   take_profit_R: 3.0          # take-profit at 3x the initial risk (3R)
-  stop_limit_offset_pct: 0.003  # stop-LIMIT placed 0.3% below the stop trigger
   use_exchange_stop: true     # also place a stop on the exchange (offline protection)
+  # Offline protective-stop order type (env: STOP_ORDER_TYPE):
+  #   "market" - STOP-MARKET (DEFAULT). Always executes through a gap/fast move, so
+  #              an overnight crash with the bot offline can't blow past an unfilled
+  #              limit and run the loss. Fills at the prevailing price (correct stop
+  #              semantics). Falls back to stop-limit if the venue rejects it.
+  #   "limit"  - legacy STOP-LIMIT resting `stop_limit_offset_pct` below the trigger;
+  #              can be SKIPPED entirely if price gaps through the band. Prefer market.
+  stop_order_type: "market"
+  stop_limit_offset_pct: 0.003  # stop-LIMIT band below trigger (ONLY used when type=limit)
 
 # --- Safety rails -----------------------------------------------------------
 safety:

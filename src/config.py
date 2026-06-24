@@ -159,6 +159,12 @@ def load_config() -> dict[str, Any]:
     if os.getenv("RECONCILE_ADOPT_ORPHANS") is not None:
         cfg["reconcile"]["adopt_orphans"] = _env_bool("RECONCILE_ADOPT_ORPHANS", True)
 
+    # --- Offline protective stop: market (gap-safe, default) | limit (legacy). ----
+    cfg.setdefault("exits", {})
+    cfg["exits"].setdefault("stop_order_type", "market")
+    if os.getenv("STOP_ORDER_TYPE"):
+        cfg["exits"]["stop_order_type"] = os.getenv("STOP_ORDER_TYPE").strip().lower()
+
     cfg["runtime"] = {
         "paper_trading": paper,
         "live_trading_enabled": live_enabled,

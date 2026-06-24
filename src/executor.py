@@ -11,7 +11,7 @@ the whole universe. Three execution modes (decided in config):
 Long-only spot:
     market_buy(symbol, quote)       -> buy base coin with quote cash
     market_sell(symbol, qty)        -> sell base coin for quote cash
-    place_stop_limit_sell(symbol..) -> exchange-side protective stop (best-effort)
+    place_protective_stop(symbol..) -> exchange-side protective stop (market/limit)
     cancel(symbol, order_id)        -> cancel a resting order
 """
 from __future__ import annotations
@@ -50,6 +50,14 @@ class SpotExecutor:
         self.paper_fill_model = str(ex.get("paper_limit_fill_model", "optimistic")).lower()
         self.paper_fill_ratio = min(1.0, max(0.0, float(ex.get("paper_limit_fill_ratio", 1.0))))
         self.max_entry_chase_bps = float(ex.get("max_entry_chase_bps", 0.0) or 0.0)
+
+        # --- Protective (offline) stop config -----------------------------------
+        # Default STOP-MARKET: a gap/fast move can't blow through a limit band and
+        # leave the position unprotected while we're offline. `limit` restores the
+        # legacy stop-limit (whose band is stop_limit_offset_pct).
+        exits = cfg.get("exits", {}) or {}
+        self.stop_order_type = str(exits.get("stop_order_type", "market")).lower()
+        self.stop_limit_offset = float(exits.get("stop_limit_offset_pct", 0.003))
 
         # --- Slippage instrumentation (intended vs actual on every fill) ---
         self.slippage = SlippageRecorder(
@@ -361,11 +369,18 @@ class SpotExecutor:
         return {"id": a.get("id"), "qty": qty, "price": price, "cost": cost, "fee": fee,
                 "order_type": "limit+market"}
 
-    def place_stop_limit_sell(self, symbol: str, qty: float, stop_price: float,
-                              limit_price: float) -> Optional[str]:
+    def place_protective_stop(self, symbol: str, qty: float, stop_price: float) -> Optional[str]:
+        """Exchange-side protective stop for OFFLINE protection (best-effort).
+
+        Defaults to a STOP-MARKET so a gap or fast move can't blow through a limit
+        band and leave the position unprotected while the bot is offline (the
+        original stop-LIMIT gap risk). `exits.stop_order_type: limit` restores the
+        legacy stop-limit, whose band is `exits.stop_limit_offset_pct` (widening it
+        reduces, but never eliminates, the skip risk - prefer market). A market-stop
+        rejection falls back to a stop-limit; if both fail the software trail still
+        protects while the bot is online. Returns the venue order id, or None."""
         qty = self.amount_prec(symbol, qty)
         stop_price = self.price_prec(symbol, stop_price)
-        limit_price = self.price_prec(symbol, limit_price)
         if qty <= 0:
             return None
 
@@ -373,12 +388,30 @@ class SpotExecutor:
             self._seq += 1
             return f"sim-stop-{self._seq}"
 
+        if self.stop_order_type == "market":
+            try:
+                order = self.exchange.create_order(
+                    symbol, "market", "sell", qty, None, {"stopPrice": stop_price})
+                self._log("{} {} protective STOP-MARKET id={} stop={:.4f}",
+                          self.tag, symbol, order.get("id"), stop_price)
+                return order.get("id")
+            except Exception as exc:
+                logger.warning("{} {} stop-market rejected ({}); trying stop-limit.",
+                               self.tag, symbol, str(exc).splitlines()[0][:100])
+                # fall through to the limit variant rather than leaving it unprotected
+        return self._place_stop_limit(symbol, qty, stop_price)
+
+    def _place_stop_limit(self, symbol: str, qty: float, stop_price: float) -> Optional[str]:
+        """Legacy stop-limit protective order (resting limit `stop_limit_offset_pct`
+        below the trigger). Can be skipped if price gaps through the band - that is
+        exactly why `place_protective_stop` prefers a stop-market by default."""
+        limit_price = self.price_prec(symbol, stop_price * (1 - self.stop_limit_offset))
         try:
             order = self.exchange.create_order(
                 symbol, "limit", "sell", qty, limit_price,
                 {"stopPrice": stop_price, "timeInForce": "GTC"})
-            self._log("{} {} protective STOP-LIMIT id={} stop={:.4f}",
-                      self.tag, symbol, order.get("id"), stop_price)
+            self._log("{} {} protective STOP-LIMIT id={} stop={:.4f} limit={:.4f}",
+                      self.tag, symbol, order.get("id"), stop_price, limit_price)
             return order.get("id")
         except Exception as exc:
             logger.warning("{} {} stop-limit not placed ({}); software stop protects.",
