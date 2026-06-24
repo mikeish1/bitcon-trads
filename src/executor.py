@@ -190,7 +190,7 @@ class SpotExecutor:
                 return None                       # caller skips record_open -> no phantom position
             cost = float(order.get("cost") or (filled * price_hint))
             avg = float(order.get("average") or (cost / filled if filled else price_hint))
-            fee = self._extract_fee(order)
+            fee = self._extract_fee(order, symbol, avg)
             self._log("{} BUY {} filled {:.6f}/{:.6f} @ {:.4f} (cost {:.2f}, fee {:.2f})",
                       self.tag, symbol, filled, qty, avg, cost, fee)
             fill = {"id": order.get("id"), "qty": filled, "price": avg, "cost": cost, "fee": fee}
@@ -229,7 +229,7 @@ class SpotExecutor:
                 return None                       # caller keeps the position OPEN and retries
             proceeds = float(order.get("cost") or (filled * price_hint))
             avg = float(order.get("average") or (proceeds / filled if filled else price_hint))
-            fee = self._extract_fee(order)
+            fee = self._extract_fee(order, symbol, avg)
             self._log("{} SELL {} filled {:.6f}/{:.6f} @ {:.4f} ({}) proceeds {:.2f} fee {:.2f}",
                       self.tag, symbol, filled, qty, avg, reason, proceeds, fee)
             fill = {"id": order.get("id"), "qty": filled, "price": avg, "proceeds": proceeds, "fee": fee}
@@ -329,7 +329,7 @@ class SpotExecutor:
         if filled > 0:
             cost = float(order.get("cost") or filled * limit_price)
             avg = float(order.get("average") or (cost / filled if filled else limit_price))
-            fee = self._extract_fee(order)
+            fee = self._extract_fee(order, symbol, avg)
             self._log("{} LIMIT BUY {} filled {:.6f}/{:.6f} @ {:.4f} (cost {:.2f}, fee {:.2f})",
                       self.tag, symbol, filled, qty, avg, cost, fee)
             result = self._attach_slippage(
@@ -426,13 +426,66 @@ class SpotExecutor:
         except Exception as exc:
             logger.warning("Cancel of {} ({}) failed (may be gone): {}", order_id, symbol, exc)
 
+    def resolve_fill_price(self, symbol: str, order_id: Optional[str], fallback: float) -> float:
+        """Best-effort ACTUAL average fill price of a (now-closed) order - e.g. a stop
+        that triggered while we were offline. Returns `fallback` when it can't be
+        determined (no id, sim mode, venue error, or no average reported), so callers
+        can pass a conservative estimate as the floor."""
+        if not order_id or not self.place:
+            return fallback
+        try:
+            order = self.exchange.fetch_order(order_id, symbol)
+            avg, filled = order.get("average"), order.get("filled")
+            if avg and float(avg) > 0 and filled and float(filled) > 0:
+                return float(avg)
+        except Exception as exc:
+            logger.warning("{} {} could not resolve offline fill {} ({}); using estimate.",
+                           self.tag, symbol, order_id, exc)
+        return fallback
+
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _extract_fee(order: dict[str, Any]) -> float:
+    def _extract_fee(self, order: dict[str, Any], symbol: str, fill_price: float) -> float:
+        """Order fee normalized to the QUOTE currency.
+
+        ccxt reports fees in varying currencies: the quote (USD/USDT), the BASE asset
+        (common on spot BUYs), or a discount token (e.g. BNB). The bot accounts in
+        quote, so a base- or token-denominated fee MUST be converted or it silently
+        mis-states cost, PnL and slippage. Base fees convert via the fill price; other
+        currencies via a best-effort ticker, falling back to the raw cost only as a
+        last resort."""
+        base, quote = symbol.split("/")[0].upper(), symbol.split("/")[-1].upper()
         fee = order.get("fee") or {}
-        if isinstance(fee, dict) and fee.get("cost") is not None:
+        fees = order.get("fees") or ([fee] if fee else [])     # ccxt may report a list
+        total = 0.0
+        for f in fees:
+            if not isinstance(f, dict) or f.get("cost") is None:
+                continue
             try:
-                return float(fee["cost"])
+                cost = float(f["cost"])
             except (TypeError, ValueError):
-                pass
-        return 0.0
+                continue
+            ccy = str(f.get("currency") or quote).upper()
+            if ccy == quote:
+                total += cost
+            elif ccy == base and fill_price:
+                total += cost * fill_price                      # base units -> quote
+            else:
+                conv = self._fee_to_quote(ccy, quote, cost)
+                total += conv if conv is not None else cost     # last resort: assume quote
+        return total
+
+    def _fee_to_quote(self, ccy: str, quote: str, cost: float) -> Optional[float]:
+        """Convert a discount-token fee (e.g. BNB) to quote via a best-effort ticker.
+        Returns None when no quote is available (offline/sim) so the caller decides."""
+        if ccy == quote:
+            return cost
+        if not self.place:
+            return None
+        try:
+            t = self.exchange.fetch_ticker(f"{ccy}/{quote}")
+            px = t.get("last") or t.get("close")
+            if px and float(px) > 0:
+                return cost * float(px)
+        except Exception:
+            pass
+        return None
