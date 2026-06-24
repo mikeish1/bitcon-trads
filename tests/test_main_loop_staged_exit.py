@@ -31,7 +31,7 @@ class StubExecutor:
     def cancel(self, symbol, order_id):
         self.cancels.append((symbol, order_id))
 
-    def place_stop_limit_sell(self, symbol, qty, stop, limit):
+    def place_protective_stop(self, symbol, qty, stop):
         self._seq += 1
         sid = f"stop-{self._seq}"
         self.stops.append({"symbol": symbol, "qty": qty, "stop": stop, "id": sid})

@@ -370,8 +370,7 @@ class TradingBot:
             stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
             stop_order_id = None
             if self.use_exchange_stop:
-                stop_order_id = self.executor.place_stop_limit_sell(
-                    sym, fill["qty"], stop0, self.risk.stop_limit_price(stop0))
+                stop_order_id = self.executor.place_protective_stop(sym, fill["qty"], stop0)
             self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, decision.reasoning,
                                   peak_price=fill["price"], entry_atr=s["atr"])
         except Exception as exc:
@@ -483,8 +482,7 @@ class TradingBot:
             stop0 = self.risk.chandelier_stop(fill["price"], s["atr"])
             stop_order_id = None
             if self.use_exchange_stop:
-                stop_order_id = self.executor.place_stop_limit_sell(
-                    sym, fill["qty"], stop0, self.risk.stop_limit_price(stop0))
+                stop_order_id = self.executor.place_protective_stop(sym, fill["qty"], stop0)
             self.risk.record_open(sym, fill, stop0, 0.0, stop_order_id, reason,
                                   peak_price=fill["price"], entry_atr=s["atr"])
             self.risk.log_decision(sym, "BUY", 1, False, reason)
@@ -557,8 +555,7 @@ class TradingBot:
         if (self.cfg["runtime"]["place_orders"] and self.use_exchange_stop
                 and (scaled or current_stop > prev_stop * 1.001)):
             self.executor.cancel(sym, pos["stop_order_id"])
-            sid = self.executor.place_stop_limit_sell(
-                sym, pos["qty"], current_stop, self.risk.stop_limit_price(current_stop))
+            sid = self.executor.place_protective_stop(sym, pos["qty"], current_stop)
             if current_stop > prev_stop * 1.001:
                 logger.info("{} chandelier raised {:.4f} -> {:.4f}", sym, prev_stop, current_stop)
         self.risk.update_trail(pos["id"], peak, current_stop, sid)

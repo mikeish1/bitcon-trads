@@ -56,7 +56,6 @@ class RiskManager:
         self.min_stop_pct = e.get("min_stop_pct", 0.01)
         self.atr_trail_mult = e["atr_trail_mult"]
         self.take_profit_R = e["take_profit_R"]
-        self.stop_limit_offset = e["stop_limit_offset_pct"]
         self.chandelier_mult = cfg.get("strategy", {}).get("donchian", {}).get(
             "atr_trail_mult", self.atr_trail_mult)
 
@@ -480,9 +479,6 @@ class RiskManager:
             out["reason"] = (f"scale-out {scale_fraction:.0%} at "
                              f"+{'/'.join(f'{x:g}' for x in fired)}xATR (profit {profit_atr:.1f}R)")
         return out
-
-    def stop_limit_price(self, stop_price: float) -> float:
-        return stop_price * (1 - self.stop_limit_offset)
 
     def trailing_stop(self, price: float, atr: float) -> float:
         return price - max(self.atr_trail_mult * atr, price * self.min_stop_pct)

@@ -194,3 +194,63 @@ def test_donchian_does_not_fire_on_forming_bar_breakout():
     assert strat.decide({"1d": df}).action == "BUY"
     # Confirmed-close view (forming bar dropped) -> correctly FLAT (the fix).
     assert strat.decide({"1d": df.iloc[:-1].reset_index(drop=True)}).action == "FLAT"
+
+
+# --------------------------------------------------------------------------- #
+# H2: offline protective stop is a STOP-MARKET (gap-safe) by default          #
+# --------------------------------------------------------------------------- #
+class StopExchange:
+    """Captures create_order calls; can reject stop-market to test the fallback."""
+    def __init__(self, reject_market=False):
+        self.reject_market = reject_market
+        self.orders = []
+
+    def amount_to_precision(self, s, q): return float(q)
+    def price_to_precision(self, s, p): return round(float(p), 2)
+
+    def create_order(self, symbol, otype, side, qty, price, params):
+        if otype == "market" and self.reject_market:
+            raise Exception("stop-market not supported on this venue")
+        self.orders.append({"type": otype, "side": side, "qty": qty,
+                            "price": price, "params": params})
+        return {"id": f"{otype}-1"}
+
+
+def _stops_cfg(db_path, stop_type=None):
+    cfg = _exec_cfg(db_path)
+    if stop_type is not None:
+        cfg["exits"] = {"stop_order_type": stop_type, "stop_limit_offset_pct": 0.003}
+    return cfg
+
+
+def test_protective_stop_defaults_to_market(tmp_path):
+    fx = StopExchange()
+    ex = SpotExecutor(_stops_cfg(str(tmp_path / "t.db")), exchange=fx)   # no exits -> market
+    assert ex.place_protective_stop("BTC/USD", 1.0, 90.0) == "market-1"
+    o = fx.orders[-1]
+    assert o["type"] == "market" and o["price"] is None                 # market, no limit band
+    assert o["params"]["stopPrice"] == pytest.approx(90.0)
+
+
+def test_protective_stop_limit_mode_uses_band(tmp_path):
+    fx = StopExchange()
+    ex = SpotExecutor(_stops_cfg(str(tmp_path / "t.db"), "limit"), exchange=fx)
+    assert ex.place_protective_stop("BTC/USD", 1.0, 100.0) == "limit-1"
+    o = fx.orders[-1]
+    assert o["type"] == "limit"
+    assert o["price"] == pytest.approx(99.7)                            # 100 * (1 - 0.003)
+    assert o["params"]["stopPrice"] == pytest.approx(100.0)
+
+
+def test_protective_stop_market_rejection_falls_back_to_limit(tmp_path):
+    fx = StopExchange(reject_market=True)
+    ex = SpotExecutor(_stops_cfg(str(tmp_path / "t.db")), exchange=fx)   # market default
+    assert ex.place_protective_stop("BTC/USD", 1.0, 100.0) == "limit-1"
+    assert fx.orders[-1]["type"] == "limit"                             # fell back, still protected
+
+
+def test_protective_stop_sim_returns_sim_id(tmp_path):
+    cfg = _stops_cfg(str(tmp_path / "t.db"))
+    cfg["runtime"]["place_orders"] = False
+    ex = SpotExecutor(cfg, exchange=StopExchange())
+    assert ex.place_protective_stop("BTC/USD", 1.0, 90.0).startswith("sim-stop-")
