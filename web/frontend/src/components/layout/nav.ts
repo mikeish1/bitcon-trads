@@ -1,6 +1,7 @@
 import {
   LayoutDashboard,
   Wallet,
+  Layers,
   History,
   Brain,
   LineChart,
@@ -21,6 +22,7 @@ export interface NavItem {
 /** Primary navigation, one entry per domain (architecture §2). */
 export const navItems: NavItem[] = [
   { to: "/", label: "Overview", icon: LayoutDashboard, end: true },
+  { to: "/sleeves", label: "Sleeves", icon: Layers },
   { to: "/positions", label: "Positions", icon: Wallet },
   { to: "/history", label: "History", icon: History },
   { to: "/decisions", label: "Decisions", icon: Brain },

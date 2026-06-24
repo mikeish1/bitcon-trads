@@ -6,6 +6,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 // Route-level code splitting: each page is its own chunk.
 const Overview = lazy(() => import("@/pages/Overview"));
+const Sleeves = lazy(() => import("@/pages/Sleeves"));
 const Positions = lazy(() => import("@/pages/Positions"));
 const History = lazy(() => import("@/pages/History"));
 const Decisions = lazy(() => import("@/pages/Decisions"));
@@ -21,6 +22,7 @@ const router = createBrowserRouter([
     element: <AppShell />,
     children: [
       { index: true, element: <Overview /> },
+      { path: "sleeves", element: <Sleeves /> },
       { path: "positions", element: <Positions /> },
       { path: "history", element: <History /> },
       { path: "decisions", element: <Decisions /> },

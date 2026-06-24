@@ -263,6 +263,104 @@ export interface HealthStatus {
   server_time: string;
 }
 
+// ---- Sleeves (spot / carry / etf coverage) -------------------------------- //
+export interface SleeveCard {
+  key: "spot" | "carry" | "etf" | string;
+  label: string;
+  active: boolean;
+  mode: string | null;
+  open_positions: number;
+  primary_value_usd: number | null;
+  primary_label: string;
+  realized_pnl_usd: number | null;
+  capital_source: string | null;
+  capital_description: string | null;
+  note: string | null;
+}
+
+export interface SleevesOverview {
+  cards: SleeveCard[];
+  as_of: string;
+}
+
+export interface EtfHolding {
+  id: number;
+  symbol: string;
+  opened_at: string;
+  age_days: number;
+  qty: number;
+  entry_price: number;
+  cost_usd: number;
+  mode: string;
+  reason: string;
+  last_price: number | null;
+  market_value: number | null;
+  unrealized_pnl_usd: number | null;
+  unrealized_pnl_pct: number | null;
+  price_is_stale: boolean;
+}
+
+export interface EtfSleeve {
+  available: boolean;
+  mode: string | null;
+  priced: boolean;
+  paper_cash: number | null;
+  holdings_cost_usd: number;
+  holdings_market_value: number | null;
+  equity_estimate: number | null;
+  realized_pnl_usd: number;
+  open_positions: number;
+  deployable_capital: number | null;
+  capital_source: string | null;
+  capital_description: string | null;
+  last_rebalance: string | null;
+  regime: string | null;
+  holdings: EtfHolding[];
+  as_of: string;
+}
+
+export interface CarryPair {
+  id: number;
+  asset: string;
+  opened_at: string;
+  age_hours: number;
+  notional_usd: number;
+  capital_usd: number;
+  spot_qty: number;
+  spot_entry: number;
+  perp_qty: number;
+  perp_entry: number;
+  funding_accrued_usd: number;
+  low_reads: number;
+  delta_drift_pct: number;
+  unwind_in_progress: boolean;
+  mode: string;
+  reason: string;
+}
+
+export interface CarryFundingPoint {
+  day: string;
+  amount_usd: number;
+}
+
+export interface CarrySleeve {
+  available: boolean;
+  mode: string | null;
+  open_pairs_count: number;
+  capital_used: number;
+  deployable_capital: number | null;
+  capital_source: string | null;
+  capital_description: string | null;
+  funding_today_usd: number;
+  funding_total_usd: number;
+  realized_today_usd: number;
+  realized_total_usd: number;
+  kill_active: boolean;
+  pairs: CarryPair[];
+  funding_series: CarryFundingPoint[];
+  as_of: string;
+}
+
 // ---- SSE event payloads --------------------------------------------------- //
 export type SseEventName =
   | "summary_update"

@@ -114,6 +114,46 @@ export const glossary = {
       "An optional mode that holds only the K strongest coins (by N-day momentum) that have an active trend, rotating periodically.",
     math: "momentum = close ÷ close(N days ago) − 1; hold top-K",
   },
+
+  // --- Sleeves: the carry & ETF strategies run alongside spot ----------------
+  sleeves: {
+    term: "Strategy sleeves",
+    plain:
+      "The supervisor can run three independent strategies into one account: spot trend-following, funding carry, and ETF momentum. Each has its own capital limit, positions and ledger; this page shows all three side by side.",
+  },
+  fundingCarry: {
+    term: "Funding carry",
+    plain:
+      "A market-neutral strategy: buy the asset on the spot market and short an equal amount of its perpetual future. It earns the funding rate the shorts collect while staying flat to price moves.",
+    math: "P&L ≈ funding income − fees (price moves on the two legs cancel)",
+  },
+  deltaNeutral: {
+    term: "Delta-neutral pair",
+    plain:
+      "Long spot + short perp in equal size, so the position barely moves when the price does. The two legs offset, leaving funding as the return driver. 'Delta drift' flags if the legs fall out of balance (e.g. a partial fill).",
+    math: "net delta = spot_qty − perp_qty ≈ 0",
+  },
+  fundingAccrued: {
+    term: "Funding accrued",
+    plain:
+      "Funding income booked on an open pair so far. It is unrealized until the pair is unwound, at which point it is rolled into realized P&L.",
+  },
+  carryCapital: {
+    term: "Capital used (carry)",
+    plain:
+      "A cross-venue carry needs cash to buy spot AND margin to short the perp, so capital per pair is larger than the notional. This is the total committed across both venues, capped by the sleeve limit.",
+    math: "capital = notional × (1 + 1 ÷ leverage)",
+  },
+  etfMomentum: {
+    term: "ETF momentum sleeve",
+    plain:
+      "A low-frequency equities sleeve. It holds the strongest trending ETFs (or a fixed-weight basket in static mode) and rebalances on a schedule, rotating out names that lose their trend.",
+  },
+  etfPriceUnavailable: {
+    term: "Live equity price unavailable",
+    plain:
+      "The read-only dashboard prices crypto from a public feed, but holds no equities data source, so ETF holdings are shown at cost basis. Realized P&L on closed ETF positions is exact; open-position mark-to-market is not computed here.",
+  },
 } as const satisfies Record<string, GlossaryEntry>;
 
 export type GlossaryKey = keyof typeof glossary;
