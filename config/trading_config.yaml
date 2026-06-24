@@ -12,6 +12,12 @@ market:
   confirm_timeframes: []      # donchian mode uses a single timeframe
   backfill_candles: 400       # daily candles on startup (~1.1y; warms indicators)
   poll_seconds: 900           # check every 15 min (a daily strategy needs no faster)
+  # Decide breakout signals + ratchet the chandelier trail on the last CONFIRMED-
+  # CLOSED daily bar (recommended). The latest bar is still forming during the day,
+  # so signalling on it is lookahead vs the close-based backtest and produces
+  # intraday false-breakout whipsaw. Marking/sizing/exit-breach keep the live price.
+  # Mirrors the ETF sleeve's ETF_SIGNAL_ON_CLOSED_CANDLE. Env: SIGNAL_ON_CLOSED_CANDLE.
+  signal_on_closed_candle: true
 
 # --- The trading universe (dynamic; add/remove coins here, no code changes) --
 # List the BASE assets you want to trade. The quote currency is chosen per venue
@@ -288,8 +294,21 @@ exits:
                               #    on the small 5m ATR). This usually dominates.
   atr_trail_mult: 2.5         # trailing stop = price - 2.5 * ATR (ratchets up only)
   take_profit_R: 3.0          # take-profit at 3x the initial risk (3R)
-  stop_limit_offset_pct: 0.003  # stop-LIMIT placed 0.3% below the stop trigger
   use_exchange_stop: true     # also place a stop on the exchange (offline protection)
+  # Offline protective-stop order type (env: STOP_ORDER_TYPE):
+  #   "market" - STOP-MARKET (DEFAULT). Always executes through a gap/fast move, so
+  #              an overnight crash with the bot offline can't blow past an unfilled
+  #              limit and run the loss. Fills at the prevailing price (correct stop
+  #              semantics). Falls back to stop-limit if the venue rejects it.
+  #   "limit"  - legacy STOP-LIMIT resting `stop_limit_offset_pct` below the trigger;
+  #              can be SKIPPED entirely if price gaps through the band. Prefer market.
+  stop_order_type: "market"
+  stop_limit_offset_pct: 0.003  # stop-LIMIT band below trigger (ONLY used when type=limit)
+  # When a stop fills while the bot is OFFLINE and the venue can't tell us the real
+  # fill, the close is booked at a conservative estimate (the worse of the trigger
+  # and the last mark). This optional haircut models additional gap slippage BELOW
+  # the trigger so the loss is never under-counted by the safety rails. 0 = off.
+  offline_stop_slippage_pct: 0.0
 
 # --- Safety rails -----------------------------------------------------------
 safety:
@@ -299,6 +318,15 @@ safety:
   cooldown_minutes: 60        # wait this long after an exit before buying again
   max_trades_per_day: 4       # hard cap on entries per day
   max_open_positions: 1       # one BTC position at a time
+
+# --- Crash recovery / position reconciliation -------------------------------
+# On startup (broker venues) the bot closes DB rows whose coins have left the
+# account AND adopts any untracked holding in its universe - an "orphan" left by a
+# crash between a live fill and the DB write - immediately attaching a protective
+# chandelier stop so it is never managed-less. Assumes a DEDICATED account (the bot
+# already marks the WHOLE account as its equity). Set false for a shared account.
+reconcile:
+  adopt_orphans: true         # env: RECONCILE_ADOPT_ORPHANS
 
 execution:
   taker_fee_pct: 0.001        # Binance.US spot taker fee (~0.10%)

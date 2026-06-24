@@ -97,6 +97,38 @@ class DataPipeline:
         return float(frames[primary_tf].iloc[-1]["close"])
 
     # ------------------------------------------------------------------ #
+    # Closed-candle gating (no lookahead on the still-forming bar)        #
+    # ------------------------------------------------------------------ #
+    def is_bar_forming(self, df: pd.DataFrame, timeframe: str) -> bool:
+        """True if the last row is the still-forming bar for `timeframe` (its close
+        time is in the future). Acting on this bar is lookahead vs a close-based
+        backtest. Best-effort: returns False if the timeframe can't be parsed."""
+        if df is None or len(df) == 0 or "timestamp" not in df.columns:
+            return False
+        try:
+            tf_ms = self.exchange.parse_timeframe(timeframe) * 1000
+            now_ms = self.exchange.milliseconds()
+        except Exception:
+            return False
+        last_open_ms = int(pd.Timestamp(df.iloc[-1]["timestamp"]).value // 1_000_000)
+        return (last_open_ms + tf_ms) > now_ms
+
+    def signal_frames(self, frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        """Frames for DECISIONS: drop the still-forming primary bar so breakout +
+        trail logic see only CONFIRMED closes (matches the validated backtest).
+        Marking, sizing and the live exit-breach check keep the original (live) last
+        bar. No-op when `market.signal_on_closed_candle` is off or the bar is closed.
+        """
+        if not bool(self.cfg["market"].get("signal_on_closed_candle", True)):
+            return frames
+        df = frames.get(self.primary_tf)
+        if df is not None and len(df) > 1 and self.is_bar_forming(df, self.primary_tf):
+            out = dict(frames)
+            out[self.primary_tf] = df.iloc[:-1].reset_index(drop=True)
+            return out
+        return frames
+
+    # ------------------------------------------------------------------ #
     # Account / universe                                                 #
     # ------------------------------------------------------------------ #
     def fetch_balances(self) -> dict[str, float]:

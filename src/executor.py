@@ -11,7 +11,7 @@ the whole universe. Three execution modes (decided in config):
 Long-only spot:
     market_buy(symbol, quote)       -> buy base coin with quote cash
     market_sell(symbol, qty)        -> sell base coin for quote cash
-    place_stop_limit_sell(symbol..) -> exchange-side protective stop (best-effort)
+    place_protective_stop(symbol..) -> exchange-side protective stop (market/limit)
     cancel(symbol, order_id)        -> cancel a resting order
 """
 from __future__ import annotations
@@ -50,6 +50,14 @@ class SpotExecutor:
         self.paper_fill_model = str(ex.get("paper_limit_fill_model", "optimistic")).lower()
         self.paper_fill_ratio = min(1.0, max(0.0, float(ex.get("paper_limit_fill_ratio", 1.0))))
         self.max_entry_chase_bps = float(ex.get("max_entry_chase_bps", 0.0) or 0.0)
+
+        # --- Protective (offline) stop config -----------------------------------
+        # Default STOP-MARKET: a gap/fast move can't blow through a limit band and
+        # leave the position unprotected while we're offline. `limit` restores the
+        # legacy stop-limit (whose band is stop_limit_offset_pct).
+        exits = cfg.get("exits", {}) or {}
+        self.stop_order_type = str(exits.get("stop_order_type", "market")).lower()
+        self.stop_limit_offset = float(exits.get("stop_limit_offset_pct", 0.003))
 
         # --- Slippage instrumentation (intended vs actual on every fill) ---
         self.slippage = SlippageRecorder(
@@ -114,6 +122,38 @@ class SpotExecutor:
             pass
         return self.min_notional
 
+    def _resolve_filled(self, order: dict[str, Any], symbol: str, requested_qty: float) -> float:
+        """Return the ACTUAL filled quantity for a just-placed order.
+
+        Original defect: callers did ``float(order.get("filled") or qty)``, which maps
+        BOTH ``None`` (venue hasn't reported the fill yet) AND ``0.0`` (rejected /
+        unfilled) to the full requested qty - so the bot books a position it does not
+        own, then places a protective stop / later sells size that isn't there (a
+        state-vs-reality desync on the money path). Here a reported ``0`` stays ``0``,
+        and an UNKNOWN (None/missing) fill is re-fetched once before we decide rather
+        than optimistically assumed."""
+        raw = order.get("filled")
+        if raw is not None:                       # venue reported a number (incl. 0.0)
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+        oid = order.get("id")
+        if oid:                                   # unknown -> ask the venue once
+            try:
+                fresh = self.exchange.fetch_order(oid, symbol)
+                if fresh.get("filled") is not None:
+                    return float(fresh["filled"])
+                order = fresh                     # use the fresh status below
+            except Exception as exc:
+                logger.warning("{} {} fill-status fetch failed ({}); treating as unfilled.",
+                               self.tag, symbol, exc)
+                return 0.0
+        # Still unknown: only trust the request size if the venue says it's done.
+        if (order.get("status") or "").lower() in ("closed", "filled"):
+            return requested_qty
+        return 0.0
+
     # ------------------------------------------------------------------ #
     def market_buy(self, symbol: str, quote_to_spend: float, price_hint: float,
                    intended_price: Optional[float] = None,
@@ -142,12 +182,17 @@ class SpotExecutor:
 
         try:
             order = self.exchange.create_market_buy_order(symbol, qty)
-            filled = float(order.get("filled") or qty)
+            # FIX: never assume a fill. A reported 0 stays 0; an unknown is resolved.
+            filled = self._resolve_filled(order, symbol, qty)
+            if filled <= 0:
+                logger.error("{} {} BUY returned no fill (status={}); NO position booked.",
+                             self.tag, symbol, order.get("status"))
+                return None                       # caller skips record_open -> no phantom position
             cost = float(order.get("cost") or (filled * price_hint))
             avg = float(order.get("average") or (cost / filled if filled else price_hint))
-            fee = self._extract_fee(order)
-            self._log("{} BUY {} filled {:.6f} @ {:.4f} (cost {:.2f}, fee {:.2f})",
-                      self.tag, symbol, filled, avg, cost, fee)
+            fee = self._extract_fee(order, symbol, avg)
+            self._log("{} BUY {} filled {:.6f}/{:.6f} @ {:.4f} (cost {:.2f}, fee {:.2f})",
+                      self.tag, symbol, filled, qty, avg, cost, fee)
             fill = {"id": order.get("id"), "qty": filled, "price": avg, "cost": cost, "fee": fee}
             return self._attach_slippage(fill, symbol, "buy", order_type, intended)
         except Exception as exc:
@@ -175,12 +220,18 @@ class SpotExecutor:
 
         try:
             order = self.exchange.create_market_sell_order(symbol, qty)
-            filled = float(order.get("filled") or qty)
+            # FIX: a reported 0/None fill must NOT be booked as a full exit, or the DB
+            # would mark the position CLOSED while the coins are still in the account.
+            filled = self._resolve_filled(order, symbol, qty)
+            if filled <= 0:
+                logger.error("{} {} SELL returned no fill (status={}); position NOT closed.",
+                             self.tag, symbol, order.get("status"))
+                return None                       # caller keeps the position OPEN and retries
             proceeds = float(order.get("cost") or (filled * price_hint))
             avg = float(order.get("average") or (proceeds / filled if filled else price_hint))
-            fee = self._extract_fee(order)
-            self._log("{} SELL {} filled {:.6f} @ {:.4f} ({}) proceeds {:.2f} fee {:.2f}",
-                      self.tag, symbol, filled, avg, reason, proceeds, fee)
+            fee = self._extract_fee(order, symbol, avg)
+            self._log("{} SELL {} filled {:.6f}/{:.6f} @ {:.4f} ({}) proceeds {:.2f} fee {:.2f}",
+                      self.tag, symbol, filled, qty, avg, reason, proceeds, fee)
             fill = {"id": order.get("id"), "qty": filled, "price": avg, "proceeds": proceeds, "fee": fee}
             return self._attach_slippage(fill, symbol, "sell", order_type, intended, reason)
         except Exception as exc:
@@ -278,7 +329,7 @@ class SpotExecutor:
         if filled > 0:
             cost = float(order.get("cost") or filled * limit_price)
             avg = float(order.get("average") or (cost / filled if filled else limit_price))
-            fee = self._extract_fee(order)
+            fee = self._extract_fee(order, symbol, avg)
             self._log("{} LIMIT BUY {} filled {:.6f}/{:.6f} @ {:.4f} (cost {:.2f}, fee {:.2f})",
                       self.tag, symbol, filled, qty, avg, cost, fee)
             result = self._attach_slippage(
@@ -318,11 +369,18 @@ class SpotExecutor:
         return {"id": a.get("id"), "qty": qty, "price": price, "cost": cost, "fee": fee,
                 "order_type": "limit+market"}
 
-    def place_stop_limit_sell(self, symbol: str, qty: float, stop_price: float,
-                              limit_price: float) -> Optional[str]:
+    def place_protective_stop(self, symbol: str, qty: float, stop_price: float) -> Optional[str]:
+        """Exchange-side protective stop for OFFLINE protection (best-effort).
+
+        Defaults to a STOP-MARKET so a gap or fast move can't blow through a limit
+        band and leave the position unprotected while the bot is offline (the
+        original stop-LIMIT gap risk). `exits.stop_order_type: limit` restores the
+        legacy stop-limit, whose band is `exits.stop_limit_offset_pct` (widening it
+        reduces, but never eliminates, the skip risk - prefer market). A market-stop
+        rejection falls back to a stop-limit; if both fail the software trail still
+        protects while the bot is online. Returns the venue order id, or None."""
         qty = self.amount_prec(symbol, qty)
         stop_price = self.price_prec(symbol, stop_price)
-        limit_price = self.price_prec(symbol, limit_price)
         if qty <= 0:
             return None
 
@@ -330,12 +388,30 @@ class SpotExecutor:
             self._seq += 1
             return f"sim-stop-{self._seq}"
 
+        if self.stop_order_type == "market":
+            try:
+                order = self.exchange.create_order(
+                    symbol, "market", "sell", qty, None, {"stopPrice": stop_price})
+                self._log("{} {} protective STOP-MARKET id={} stop={:.4f}",
+                          self.tag, symbol, order.get("id"), stop_price)
+                return order.get("id")
+            except Exception as exc:
+                logger.warning("{} {} stop-market rejected ({}); trying stop-limit.",
+                               self.tag, symbol, str(exc).splitlines()[0][:100])
+                # fall through to the limit variant rather than leaving it unprotected
+        return self._place_stop_limit(symbol, qty, stop_price)
+
+    def _place_stop_limit(self, symbol: str, qty: float, stop_price: float) -> Optional[str]:
+        """Legacy stop-limit protective order (resting limit `stop_limit_offset_pct`
+        below the trigger). Can be skipped if price gaps through the band - that is
+        exactly why `place_protective_stop` prefers a stop-market by default."""
+        limit_price = self.price_prec(symbol, stop_price * (1 - self.stop_limit_offset))
         try:
             order = self.exchange.create_order(
                 symbol, "limit", "sell", qty, limit_price,
                 {"stopPrice": stop_price, "timeInForce": "GTC"})
-            self._log("{} {} protective STOP-LIMIT id={} stop={:.4f}",
-                      self.tag, symbol, order.get("id"), stop_price)
+            self._log("{} {} protective STOP-LIMIT id={} stop={:.4f} limit={:.4f}",
+                      self.tag, symbol, order.get("id"), stop_price, limit_price)
             return order.get("id")
         except Exception as exc:
             logger.warning("{} {} stop-limit not placed ({}); software stop protects.",
@@ -350,13 +426,66 @@ class SpotExecutor:
         except Exception as exc:
             logger.warning("Cancel of {} ({}) failed (may be gone): {}", order_id, symbol, exc)
 
+    def resolve_fill_price(self, symbol: str, order_id: Optional[str], fallback: float) -> float:
+        """Best-effort ACTUAL average fill price of a (now-closed) order - e.g. a stop
+        that triggered while we were offline. Returns `fallback` when it can't be
+        determined (no id, sim mode, venue error, or no average reported), so callers
+        can pass a conservative estimate as the floor."""
+        if not order_id or not self.place:
+            return fallback
+        try:
+            order = self.exchange.fetch_order(order_id, symbol)
+            avg, filled = order.get("average"), order.get("filled")
+            if avg and float(avg) > 0 and filled and float(filled) > 0:
+                return float(avg)
+        except Exception as exc:
+            logger.warning("{} {} could not resolve offline fill {} ({}); using estimate.",
+                           self.tag, symbol, order_id, exc)
+        return fallback
+
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _extract_fee(order: dict[str, Any]) -> float:
+    def _extract_fee(self, order: dict[str, Any], symbol: str, fill_price: float) -> float:
+        """Order fee normalized to the QUOTE currency.
+
+        ccxt reports fees in varying currencies: the quote (USD/USDT), the BASE asset
+        (common on spot BUYs), or a discount token (e.g. BNB). The bot accounts in
+        quote, so a base- or token-denominated fee MUST be converted or it silently
+        mis-states cost, PnL and slippage. Base fees convert via the fill price; other
+        currencies via a best-effort ticker, falling back to the raw cost only as a
+        last resort."""
+        base, quote = symbol.split("/")[0].upper(), symbol.split("/")[-1].upper()
         fee = order.get("fee") or {}
-        if isinstance(fee, dict) and fee.get("cost") is not None:
+        fees = order.get("fees") or ([fee] if fee else [])     # ccxt may report a list
+        total = 0.0
+        for f in fees:
+            if not isinstance(f, dict) or f.get("cost") is None:
+                continue
             try:
-                return float(fee["cost"])
+                cost = float(f["cost"])
             except (TypeError, ValueError):
-                pass
-        return 0.0
+                continue
+            ccy = str(f.get("currency") or quote).upper()
+            if ccy == quote:
+                total += cost
+            elif ccy == base and fill_price:
+                total += cost * fill_price                      # base units -> quote
+            else:
+                conv = self._fee_to_quote(ccy, quote, cost)
+                total += conv if conv is not None else cost     # last resort: assume quote
+        return total
+
+    def _fee_to_quote(self, ccy: str, quote: str, cost: float) -> Optional[float]:
+        """Convert a discount-token fee (e.g. BNB) to quote via a best-effort ticker.
+        Returns None when no quote is available (offline/sim) so the caller decides."""
+        if ccy == quote:
+            return cost
+        if not self.place:
+            return None
+        try:
+            t = self.exchange.fetch_ticker(f"{ccy}/{quote}")
+            px = t.get("last") or t.get("close")
+            if px and float(px) > 0:
+                return cost * float(px)
+        except Exception:
+            pass
+        return None

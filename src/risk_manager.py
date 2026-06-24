@@ -56,7 +56,10 @@ class RiskManager:
         self.min_stop_pct = e.get("min_stop_pct", 0.01)
         self.atr_trail_mult = e["atr_trail_mult"]
         self.take_profit_R = e["take_profit_R"]
-        self.stop_limit_offset = e["stop_limit_offset_pct"]
+        # Adverse haircut applied to the ESTIMATED fill of a stop that triggered while
+        # we were offline (a long's stop fills at/below the trigger in a gap). 0 = just
+        # take the conservative min(trigger, last mark); >0 models gap slippage.
+        self.offline_stop_slippage = float(e.get("offline_stop_slippage_pct", 0.0) or 0.0)
         self.chandelier_mult = cfg.get("strategy", {}).get("donchian", {}).get(
             "atr_trail_mult", self.atr_trail_mult)
 
@@ -481,26 +484,12 @@ class RiskManager:
                              f"+{'/'.join(f'{x:g}' for x in fired)}xATR (profit {profit_atr:.1f}R)")
         return out
 
-    def stop_limit_price(self, stop_price: float) -> float:
-        return stop_price * (1 - self.stop_limit_offset)
-
     def trailing_stop(self, price: float, atr: float) -> float:
         return price - max(self.atr_trail_mult * atr, price * self.min_stop_pct)
 
     def _win_rate(self) -> float:
         w, l = self._geti("wins"), self._geti("losses")
         return 0.5 if (w + l) < 10 else w / (w + l)
-
-    def size_buy(self, equity: float, available_usdt: float, price: float, atr: float) -> dict[str, Any]:
-        """Legacy high_conviction ATR-stop Kelly sizing (single asset)."""
-        stop_distance = max(self.atr_stop_mult * atr, price * self.min_stop_pct)
-        win = self._win_rate()
-        kelly_star = max(win - (1.0 - win) / self.kelly_payoff, 0.0)
-        rf = max(min(self.kelly_fraction * kelly_star, self.risk_per_trade), self.risk_per_trade * 0.25)
-        spend = min(equity * rf * price / stop_distance, available_usdt * self.max_position_pct)
-        return {"spend_usd": spend, "stop_price": price - stop_distance,
-                "take_price": price + self.take_profit_R * stop_distance,
-                "risk_fraction": rf, "viable": spend >= self.min_notional}
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                          #
@@ -590,18 +579,83 @@ class RiskManager:
             (_utcnow().isoformat(), symbol, action, conviction, int(consulted), reasoning))
         self.conn.commit()
 
-    def reconcile(self, balances: dict[str, float], prices: dict[str, float]) -> None:
-        """Close DB positions whose coins are no longer in the account (broker only)."""
+    def offline_exit_estimate(self, pos: sqlite3.Row, last_price: Optional[float]) -> float:
+        """Conservative exit price for a stop that filled while we were OFFLINE and
+        the real fill is unknown.
+
+        A long's protective stop fills at or BELOW its trigger (a gap fills worse), so
+        booking the close at the trigger UNDER-states the loss - which feeds the
+        consecutive-loss breaker and the daily/weekly equity rails and could keep
+        trading open when it should halt. We therefore take the worse (lower) of the
+        trigger and the last observed mark, then apply the optional gap haircut. Used
+        only as a fallback when the venue can't give us the actual fill."""
+        trigger = pos["current_stop"] or pos["stop_price"] or pos["entry_price"]
+        candidates = [c for c in (trigger, last_price) if c and c > 0]
+        est = min(candidates) if candidates else float(pos["entry_price"] or 0.0)
+        return est * (1.0 - self.offline_stop_slippage)
+
+    def reconcile(self, balances: dict[str, float], prices: dict[str, float],
+                  atrs: Optional[dict[str, float]] = None,
+                  exit_resolver: Optional[Any] = None) -> None:
+        """Broker-only reconciliation, BOTH directions:
+
+          1. CLOSE DB positions whose coins are no longer in the account (the stop
+             likely filled while we were offline).
+          2. ADOPT account holdings that have NO open DB row, immediately attaching a
+             protective stop. These are orphans from a crash between the live fill and
+             `record_open` (see main_loop._try_enter): without adoption such a position
+             runs with no software stop and no trail - unbounded downside on real
+             money. `atrs` (base -> ATR) lets the adopted stop use the chandelier;
+             when absent we fall back to a `min_stop_pct` floor until the next cycle
+             recomputes a proper trail.
+        """
         if not self.uses_broker:
             return
+        tracked = {_base_of(p["symbol"] or "") for p in self.open_positions()}
+
+        # 1) Coins gone from the account -> close the stale DB row at the BEST
+        #    available exit: the venue's actual fill if `exit_resolver` can find it,
+        #    else a conservative estimate (so the safety rails never under-count).
         for pos in self.open_positions():
             base = _base_of(pos["symbol"] or "")
             price = prices.get(base, pos["entry_price"])
             dust = self.min_notional / price if price else 0.0
             if balances.get(base, 0.0) < dust and pos["qty"] > dust:
-                logger.warning("Reconcile: {} gone from account - closing (stop likely filled).",
-                               pos["symbol"])
-                self.record_close(pos, pos["current_stop"] or price, 0.0, "offline stop fill")
+                est = self.offline_exit_estimate(pos, prices.get(base))
+                exit_px = est
+                if exit_resolver is not None:
+                    try:
+                        exit_px = float(exit_resolver(pos["symbol"], pos["stop_order_id"], est))
+                    except Exception:
+                        exit_px = est
+                logger.warning("Reconcile: {} gone from account - closing @ {:.4f} (stop filled).",
+                               pos["symbol"], exit_px)
+                self.record_close(pos, exit_px, 0.0, "offline stop fill")
+
+        # 2) Untracked holdings in our universe -> adopt + protect (crash recovery).
+        # Assumes a DEDICATED account (the bot already marks the WHOLE account as its
+        # equity). Disable via reconcile.adopt_orphans if the account is shared.
+        if not (self.cfg.get("reconcile", {}) or {}).get("adopt_orphans", True):
+            return
+        quote = self.cfg.get("quote_ccy", "USDT")
+        universe = set(self.cfg.get("universe_symbols") or [])
+        for base, qty in balances.items():
+            if base == quote or base in tracked or not qty:
+                continue
+            symbol = f"{base}/{quote}"
+            if symbol not in universe:
+                continue                     # only adopt coins this bot actually trades
+            price = prices.get(base)
+            if not price or qty * price < self.min_notional:
+                continue
+            atr = (atrs or {}).get(base, 0.0)
+            stop = (self.chandelier_stop(price, atr) if atr and atr > 0
+                    else price * (1 - self.min_stop_pct))
+            logger.warning("Reconcile: ADOPTING untracked holding {} {:.6f} @ {:.4f} "
+                           "(orphaned fill); protective stop {:.4f}.", symbol, qty, price, stop)
+            self.record_open(symbol, {"price": price, "qty": qty, "cost": qty * price, "fee": 0.0},
+                             stop, 0.0, None, "adopted orphaned holding (reconcile)",
+                             peak_price=price, entry_atr=atr or None)
 
     # ------------------------------------------------------------------ #
     def daily_stats(self, equity: float) -> dict[str, Any]:

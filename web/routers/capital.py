@@ -27,7 +27,7 @@ from src.settings_service import SLEEVES
 from web.db import ReadOnlyDB
 from web.deps import AppState, auth_read, auth_write, get_ctx, require_db
 from web.models import CapitalSimulation
-from web.security import WRITE_LIMIT, limiter
+from web.security import WRITE_LIMIT, client_ip, limiter
 from web import queries as q
 
 router = APIRouter(prefix="/api/capital-limits", tags=["capital"])
@@ -107,7 +107,7 @@ def update_one(sleeve: str, body: PolicyUpdate, request: Request,
                ctx: AppState = Depends(get_ctx), actor: str = Depends(auth_write)) -> dict[str, Any]:
     """Persist a new policy. Token REQUIRED (fail-closed) + rate-limited."""
     _require_sleeve(sleeve)
-    client = request.client.host if request.client else "unknown"
+    client = client_ip(request)   # proxy-aware so the write limiter keys on the real client
     if not limiter.allow(f"capital_put:{client}", *WRITE_LIMIT):
         raise HTTPException(status_code=429, detail="too many capital-limit changes; slow down")
 

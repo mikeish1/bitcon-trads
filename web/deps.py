@@ -27,7 +27,7 @@ from src.settings_service import CapitalSettingsService
 
 from web.db import ReadOnlyDB
 from web.prices import MarketDataClient
-from web.security import get_token
+from web.security import get_token, read_auth_required
 
 
 class AppState:
@@ -45,6 +45,10 @@ class AppState:
         self.token_required = get_token() is not None
         logger.info("Dashboard AppState ready. db={} token_auth={} universe={}",
                     self.db.path, self.token_required, self.cfg.get("universe_symbols"))
+        if not self.token_required and not read_auth_required():
+            logger.warning("Dashboard READS are OPEN (no DASHBOARD_TOKEN): equity, positions, "
+                           "trades and decisions are world-readable. Set DASHBOARD_TOKEN to "
+                           "require a token, or DASHBOARD_REQUIRE_AUTH=1 to fail closed.")
 
     # --- helpers used by several routers ---------------------------------- #
     def universe_bases(self) -> list[str]:
@@ -95,6 +99,13 @@ def auth_read(
     matching bearer token or X-API-Key header."""
     token = get_token()
     if token is None:
+        if read_auth_required():
+            # Opted into fail-closed reads but no token configured -> refuse rather
+            # than silently serving the book openly.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="dashboard reads require DASHBOARD_TOKEN to be configured "
+                       "(DASHBOARD_REQUIRE_AUTH is set).")
         return
     if _presented(authorization, x_api_key) == token:
         return
