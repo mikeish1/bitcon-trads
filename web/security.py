@@ -16,7 +16,7 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Optional
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -28,6 +28,35 @@ _SECRET_MARKERS = ("api_key", "api_secret", "secret", "token", "password", "priv
 def get_token() -> Optional[str]:
     val = os.getenv("DASHBOARD_TOKEN", "").strip()
     return val or None
+
+
+def trust_proxy() -> bool:
+    """Trust X-Forwarded-For only when set (i.e. when a known proxy like Railway
+    sits in front). Off by default, since XFF is client-spoofable with no proxy."""
+    return os.getenv("DASHBOARD_TRUST_PROXY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def read_auth_required() -> bool:
+    """Fail-closed reads: require the token on GETs too. Reads are open by default
+    (internal/trusted brief); set this on a PUBLIC deployment so equity, positions
+    and trades aren't world-readable."""
+    return os.getenv("DASHBOARD_REQUIRE_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def client_ip(request: Any) -> str:
+    """Best client IP for rate-limit keying and logs. Behind a TRUSTED proxy
+    (DASHBOARD_TRUST_PROXY=1) use the left-most X-Forwarded-For hop, so the limiter
+    keys on the real client rather than the shared proxy IP; otherwise use the socket
+    peer. Never raises."""
+    if trust_proxy():
+        try:
+            xff = request.headers.get("x-forwarded-for", "") or ""
+        except Exception:
+            xff = ""
+        if xff:
+            return xff.split(",")[0].strip()
+    client = getattr(request, "client", None)
+    return getattr(client, "host", None) or "unknown"
 
 
 def allowed_origins() -> list[str]:

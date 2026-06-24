@@ -27,7 +27,7 @@ from src.config import load_config
 
 from web import __version__
 from web.deps import AppState
-from web.security import READ_LIMIT, allowed_origins, limiter, log_request
+from web.security import READ_LIMIT, allowed_origins, client_ip, limiter, log_request
 from web.snapshots import SnapshotSampler
 from web.routers import (
     capital,
@@ -85,7 +85,7 @@ def create_app(cfg: Optional[dict[str, Any]] = None) -> FastAPI:
     # --- Request logging + read rate limiting + security headers ---
     @app.middleware("http")
     async def _observe(request: Request, call_next):
-        client = request.client.host if request.client else "unknown"
+        client = client_ip(request)   # proxy-aware (DASHBOARD_TRUST_PROXY); else socket peer
         # Cheap global read limiter (the capital PUT has its own stricter budget).
         if request.url.path.startswith("/api/") and request.method == "GET":
             if not limiter.allow(f"read:{client}", *READ_LIMIT):
