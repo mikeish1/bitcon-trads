@@ -164,7 +164,8 @@ class TradingBot:
                         atrs[_base_of(sym)] = float(last["atr"])
                 except Exception:
                     pass
-            self.risk.reconcile(balances, prices, atrs)
+            self.risk.reconcile(balances, prices, atrs,
+                                exit_resolver=self.executor.resolve_fill_price)
         except Exception as exc:
             logger.warning("Startup reconcile skipped: {}", exc)
 
@@ -504,8 +505,12 @@ class TradingBot:
         if self.cfg["runtime"]["uses_broker"]:
             dust = self.cfg["risk"]["min_notional_usd"] / price if price else 0
             if balances.get(base, 0.0) < dust and pos["qty"] > dust:
-                self.risk.record_close(pos, pos["current_stop"] or price, 0.0, "exchange stop filled")
-                self.notifier.exit(pos["current_stop"] or price, 0.0, f"{sym}: exchange stop filled")
+                # Stop filled offline: book the venue's ACTUAL fill when resolvable,
+                # else a conservative estimate so the loss isn't under-counted.
+                est = self.risk.offline_exit_estimate(pos, price)
+                exit_px = self.executor.resolve_fill_price(sym, pos["stop_order_id"], est)
+                self.risk.record_close(pos, exit_px, 0.0, "exchange stop filled")
+                self.notifier.exit(exit_px, 0.0, f"{sym}: exchange stop filled")
                 return
 
         # Market risk-off -> flatten (legacy default) unless configured to hold+tighten.

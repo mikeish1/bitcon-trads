@@ -304,6 +304,11 @@ exits:
   #              can be SKIPPED entirely if price gaps through the band. Prefer market.
   stop_order_type: "market"
   stop_limit_offset_pct: 0.003  # stop-LIMIT band below trigger (ONLY used when type=limit)
+  # When a stop fills while the bot is OFFLINE and the venue can't tell us the real
+  # fill, the close is booked at a conservative estimate (the worse of the trigger
+  # and the last mark). This optional haircut models additional gap slippage BELOW
+  # the trigger so the loss is never under-counted by the safety rails. 0 = off.
+  offline_stop_slippage_pct: 0.0
 
 # --- Safety rails -----------------------------------------------------------
 safety:

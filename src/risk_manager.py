@@ -56,6 +56,10 @@ class RiskManager:
         self.min_stop_pct = e.get("min_stop_pct", 0.01)
         self.atr_trail_mult = e["atr_trail_mult"]
         self.take_profit_R = e["take_profit_R"]
+        # Adverse haircut applied to the ESTIMATED fill of a stop that triggered while
+        # we were offline (a long's stop fills at/below the trigger in a gap). 0 = just
+        # take the conservative min(trigger, last mark); >0 models gap slippage.
+        self.offline_stop_slippage = float(e.get("offline_stop_slippage_pct", 0.0) or 0.0)
         self.chandelier_mult = cfg.get("strategy", {}).get("donchian", {}).get(
             "atr_trail_mult", self.atr_trail_mult)
 
@@ -586,8 +590,24 @@ class RiskManager:
             (_utcnow().isoformat(), symbol, action, conviction, int(consulted), reasoning))
         self.conn.commit()
 
+    def offline_exit_estimate(self, pos: sqlite3.Row, last_price: Optional[float]) -> float:
+        """Conservative exit price for a stop that filled while we were OFFLINE and
+        the real fill is unknown.
+
+        A long's protective stop fills at or BELOW its trigger (a gap fills worse), so
+        booking the close at the trigger UNDER-states the loss - which feeds the
+        consecutive-loss breaker and the daily/weekly equity rails and could keep
+        trading open when it should halt. We therefore take the worse (lower) of the
+        trigger and the last observed mark, then apply the optional gap haircut. Used
+        only as a fallback when the venue can't give us the actual fill."""
+        trigger = pos["current_stop"] or pos["stop_price"] or pos["entry_price"]
+        candidates = [c for c in (trigger, last_price) if c and c > 0]
+        est = min(candidates) if candidates else float(pos["entry_price"] or 0.0)
+        return est * (1.0 - self.offline_stop_slippage)
+
     def reconcile(self, balances: dict[str, float], prices: dict[str, float],
-                  atrs: Optional[dict[str, float]] = None) -> None:
+                  atrs: Optional[dict[str, float]] = None,
+                  exit_resolver: Optional[Any] = None) -> None:
         """Broker-only reconciliation, BOTH directions:
 
           1. CLOSE DB positions whose coins are no longer in the account (the stop
@@ -604,15 +624,24 @@ class RiskManager:
             return
         tracked = {_base_of(p["symbol"] or "") for p in self.open_positions()}
 
-        # 1) Coins gone from the account -> close the stale DB row.
+        # 1) Coins gone from the account -> close the stale DB row at the BEST
+        #    available exit: the venue's actual fill if `exit_resolver` can find it,
+        #    else a conservative estimate (so the safety rails never under-count).
         for pos in self.open_positions():
             base = _base_of(pos["symbol"] or "")
             price = prices.get(base, pos["entry_price"])
             dust = self.min_notional / price if price else 0.0
             if balances.get(base, 0.0) < dust and pos["qty"] > dust:
-                logger.warning("Reconcile: {} gone from account - closing (stop likely filled).",
-                               pos["symbol"])
-                self.record_close(pos, pos["current_stop"] or price, 0.0, "offline stop fill")
+                est = self.offline_exit_estimate(pos, prices.get(base))
+                exit_px = est
+                if exit_resolver is not None:
+                    try:
+                        exit_px = float(exit_resolver(pos["symbol"], pos["stop_order_id"], est))
+                    except Exception:
+                        exit_px = est
+                logger.warning("Reconcile: {} gone from account - closing @ {:.4f} (stop filled).",
+                               pos["symbol"], exit_px)
+                self.record_close(pos, exit_px, 0.0, "offline stop fill")
 
         # 2) Untracked holdings in our universe -> adopt + protect (crash recovery).
         # Assumes a DEDICATED account (the bot already marks the WHOLE account as its

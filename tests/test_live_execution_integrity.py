@@ -254,3 +254,100 @@ def test_protective_stop_sim_returns_sim_id(tmp_path):
     cfg["runtime"]["place_orders"] = False
     ex = SpotExecutor(cfg, exchange=StopExchange())
     assert ex.place_protective_stop("BTC/USD", 1.0, 90.0).startswith("sim-stop-")
+
+
+# --------------------------------------------------------------------------- #
+# M1: offline-stop close books a conservative / actual exit, not the trigger   #
+# --------------------------------------------------------------------------- #
+def _open_btc(rm, qty=1.0, cost=100.0, stop=95.0, oid=None):
+    rm.record_open("BTC/USD", {"price": 100.0, "qty": qty, "cost": cost, "fee": 0.0},
+                   stop, 0.0, oid, "t", peak_price=100.0, entry_atr=3.0)
+    return rm.open_position("BTC/USD")
+
+
+def test_offline_exit_estimate_takes_worse_of_trigger_and_mark():
+    rm = RiskManager(_risk_cfg())
+    pos = _open_btc(rm)                                   # trigger 95
+    assert rm.offline_exit_estimate(pos, 90.0) == pytest.approx(90.0)   # mark below trigger
+    assert rm.offline_exit_estimate(pos, 99.0) == pytest.approx(95.0)   # trigger bounds it
+
+
+def test_offline_exit_estimate_applies_gap_haircut():
+    cfg = _risk_cfg()
+    cfg["exits"]["offline_stop_slippage_pct"] = 0.01
+    rm = RiskManager(cfg)
+    pos = _open_btc(rm)
+    assert rm.offline_exit_estimate(pos, 90.0) == pytest.approx(90.0 * 0.99)
+
+
+def test_reconcile_close_books_conservative_loss_when_mark_below_stop():
+    rm = RiskManager(_risk_cfg())
+    _open_btc(rm, qty=1.0, cost=100.0, stop=95.0)
+    # Gap-down: coin gone, last mark 80 (below the 95 trigger) -> book at 80, not 95,
+    # so the loss the safety rails see is the real -20, not an understated -5.
+    rm.reconcile({"USD": 1000.0}, {"BTC": 80.0}, atrs={"BTC": 3.0})
+    row = rm.conn.execute(
+        "SELECT exit_price, pnl_usd FROM trades WHERE symbol='BTC/USD'").fetchone()
+    assert row["exit_price"] == pytest.approx(80.0)
+    assert row["pnl_usd"] == pytest.approx(-20.0)
+
+
+def test_reconcile_uses_exit_resolver_for_actual_fill():
+    rm = RiskManager(_risk_cfg())
+    _open_btc(rm, qty=1.0, cost=100.0, stop=95.0, oid="stopid")
+    # The venue can tell us the real offline fill (92) -> use it over the estimate.
+    rm.reconcile({"USD": 1000.0}, {"BTC": 90.0}, atrs={"BTC": 3.0},
+                 exit_resolver=lambda sym, oid, fb: 92.0)
+    row = rm.conn.execute("SELECT exit_price FROM trades WHERE symbol='BTC/USD'").fetchone()
+    assert row["exit_price"] == pytest.approx(92.0)
+
+
+def test_resolve_fill_price_prefers_venue_average(tmp_path):
+    class Ex:
+        def fetch_order(self, oid, sym): return {"average": 91.5, "filled": 1.0}
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")), exchange=Ex())   # place=True
+    assert ex.resolve_fill_price("BTC/USD", "oid", 88.0) == pytest.approx(91.5)
+
+
+def test_resolve_fill_price_falls_back_without_id(tmp_path):
+    ex = SpotExecutor(_exec_cfg(str(tmp_path / "t.db")), exchange=None)
+    assert ex.resolve_fill_price("BTC/USD", None, 88.0) == pytest.approx(88.0)
+
+
+# --------------------------------------------------------------------------- #
+# M2: fee normalized to the quote currency                                     #
+# --------------------------------------------------------------------------- #
+def _fee_exec(tmp_path):
+    cfg = _exec_cfg(str(tmp_path / "t.db"))
+    cfg["runtime"]["place_orders"] = False        # offline -> no ticker conversion
+    return SpotExecutor(cfg, exchange=None)
+
+
+def test_fee_in_quote_currency_passthrough(tmp_path):
+    ex = _fee_exec(tmp_path)
+    assert ex._extract_fee({"fee": {"cost": 1.25, "currency": "USD"}},
+                           "BTC/USD", 100.0) == pytest.approx(1.25)
+
+
+def test_fee_in_base_currency_converted_via_fill_price(tmp_path):
+    ex = _fee_exec(tmp_path)
+    # 0.001 BTC fee at a 50k fill -> $50, NOT 0.001 booked as dollars.
+    assert ex._extract_fee({"fee": {"cost": 0.001, "currency": "BTC"}},
+                           "BTC/USD", 50_000.0) == pytest.approx(50.0)
+
+
+def test_fee_missing_is_zero(tmp_path):
+    assert _fee_exec(tmp_path)._extract_fee({}, "BTC/USD", 100.0) == 0.0
+
+
+def test_fee_list_mixed_currencies_summed(tmp_path):
+    ex = _fee_exec(tmp_path)
+    order = {"fees": [{"cost": 0.5, "currency": "USD"},
+                      {"cost": 0.002, "currency": "BTC"}]}     # 0.5 + 0.002*100
+    assert ex._extract_fee(order, "BTC/USD", 100.0) == pytest.approx(0.7)
+
+
+def test_fee_unknown_token_falls_back_to_raw_cost_offline(tmp_path):
+    ex = _fee_exec(tmp_path)                                   # offline -> no ticker
+    assert ex._extract_fee({"fee": {"cost": 0.5, "currency": "BNB"}},
+                           "BTC/USD", 100.0) == pytest.approx(0.5)
