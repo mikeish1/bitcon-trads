@@ -31,6 +31,8 @@ from fastapi import Request
 from loguru import logger
 from starlette.concurrency import run_in_threadpool
 
+from web.security import client_ip
+
 from web.deps import AppState
 from web.models import RiskGauges
 from web import queries as q
@@ -135,7 +137,7 @@ async def event_generator(request: Request, ctx: AppState) -> AsyncIterator[str]
     disconnects. DB work is offloaded to a threadpool so the event loop stays free."""
     wm = _Watermarks()
     tick = 0
-    logger.info("SSE client connected: {}", request.client.host if request.client else "?")
+    logger.info("SSE client connected: {}", client_ip(request))
     # Greet with a retry hint so the browser reconnects quickly on a drop.
     yield "retry: 3000\n\n"
     try:

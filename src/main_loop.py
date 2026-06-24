@@ -289,7 +289,9 @@ class TradingBot:
                 if opened:
                     n_open += 1
                     open_value += opened
-                    avail_quote -= opened
+                    # Consume cost + estimated taker fee from in-cycle cash so a later
+                    # entry this cycle can't over-commit by the (small) fee drift.
+                    avail_quote -= opened * (1 + self.executor.fee_pct)
 
     # ------------------------------------------------------------------ #
     def _update_regime(self, snap: dict[str, dict]) -> None:
@@ -451,7 +453,7 @@ class TradingBot:
             if opened:
                 n_open += 1
                 open_value += opened
-                avail_quote -= opened
+                avail_quote -= opened * (1 + self.executor.fee_pct)   # cost + est. taker fee
 
         self.risk.state_set("last_rotation_day", today)
 

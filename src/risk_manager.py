@@ -491,17 +491,6 @@ class RiskManager:
         w, l = self._geti("wins"), self._geti("losses")
         return 0.5 if (w + l) < 10 else w / (w + l)
 
-    def size_buy(self, equity: float, available_usdt: float, price: float, atr: float) -> dict[str, Any]:
-        """Legacy high_conviction ATR-stop Kelly sizing (single asset)."""
-        stop_distance = max(self.atr_stop_mult * atr, price * self.min_stop_pct)
-        win = self._win_rate()
-        kelly_star = max(win - (1.0 - win) / self.kelly_payoff, 0.0)
-        rf = max(min(self.kelly_fraction * kelly_star, self.risk_per_trade), self.risk_per_trade * 0.25)
-        spend = min(equity * rf * price / stop_distance, available_usdt * self.max_position_pct)
-        return {"spend_usd": spend, "stop_price": price - stop_distance,
-                "take_price": price + self.take_profit_R * stop_distance,
-                "risk_fraction": rf, "viable": spend >= self.min_notional}
-
     # ------------------------------------------------------------------ #
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
