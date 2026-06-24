@@ -590,10 +590,25 @@ class RiskManager:
             (_utcnow().isoformat(), symbol, action, conviction, int(consulted), reasoning))
         self.conn.commit()
 
-    def reconcile(self, balances: dict[str, float], prices: dict[str, float]) -> None:
-        """Close DB positions whose coins are no longer in the account (broker only)."""
+    def reconcile(self, balances: dict[str, float], prices: dict[str, float],
+                  atrs: Optional[dict[str, float]] = None) -> None:
+        """Broker-only reconciliation, BOTH directions:
+
+          1. CLOSE DB positions whose coins are no longer in the account (the stop
+             likely filled while we were offline).
+          2. ADOPT account holdings that have NO open DB row, immediately attaching a
+             protective stop. These are orphans from a crash between the live fill and
+             `record_open` (see main_loop._try_enter): without adoption such a position
+             runs with no software stop and no trail - unbounded downside on real
+             money. `atrs` (base -> ATR) lets the adopted stop use the chandelier;
+             when absent we fall back to a `min_stop_pct` floor until the next cycle
+             recomputes a proper trail.
+        """
         if not self.uses_broker:
             return
+        tracked = {_base_of(p["symbol"] or "") for p in self.open_positions()}
+
+        # 1) Coins gone from the account -> close the stale DB row.
         for pos in self.open_positions():
             base = _base_of(pos["symbol"] or "")
             price = prices.get(base, pos["entry_price"])
@@ -602,6 +617,31 @@ class RiskManager:
                 logger.warning("Reconcile: {} gone from account - closing (stop likely filled).",
                                pos["symbol"])
                 self.record_close(pos, pos["current_stop"] or price, 0.0, "offline stop fill")
+
+        # 2) Untracked holdings in our universe -> adopt + protect (crash recovery).
+        # Assumes a DEDICATED account (the bot already marks the WHOLE account as its
+        # equity). Disable via reconcile.adopt_orphans if the account is shared.
+        if not (self.cfg.get("reconcile", {}) or {}).get("adopt_orphans", True):
+            return
+        quote = self.cfg.get("quote_ccy", "USDT")
+        universe = set(self.cfg.get("universe_symbols") or [])
+        for base, qty in balances.items():
+            if base == quote or base in tracked or not qty:
+                continue
+            symbol = f"{base}/{quote}"
+            if symbol not in universe:
+                continue                     # only adopt coins this bot actually trades
+            price = prices.get(base)
+            if not price or qty * price < self.min_notional:
+                continue
+            atr = (atrs or {}).get(base, 0.0)
+            stop = (self.chandelier_stop(price, atr) if atr and atr > 0
+                    else price * (1 - self.min_stop_pct))
+            logger.warning("Reconcile: ADOPTING untracked holding {} {:.6f} @ {:.4f} "
+                           "(orphaned fill); protective stop {:.4f}.", symbol, qty, price, stop)
+            self.record_open(symbol, {"price": price, "qty": qty, "cost": qty * price, "fee": 0.0},
+                             stop, 0.0, None, "adopted orphaned holding (reconcile)",
+                             peak_price=price, entry_atr=atr or None)
 
     # ------------------------------------------------------------------ #
     def daily_stats(self, equity: float) -> dict[str, Any]:

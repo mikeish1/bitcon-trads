@@ -77,6 +77,12 @@ def load_config() -> dict[str, Any]:
 
     cfg["market"]["symbol"] = os.getenv("SYMBOL", default_symbol)
 
+    # Decide signals on the last CONFIRMED-closed candle (no lookahead on the
+    # still-forming bar). Default on; env override for fast rollback if ever needed.
+    cfg["market"].setdefault("signal_on_closed_candle", True)
+    if os.getenv("SIGNAL_ON_CLOSED_CANDLE") is not None:
+        cfg["market"]["signal_on_closed_candle"] = _env_bool("SIGNAL_ON_CLOSED_CANDLE", True)
+
     # --- Dynamic multi-asset universe ---
     quote = "USD" if is_alpaca else "USDT"          # quote currency per venue
     cfg["quote_ccy"] = quote
@@ -146,6 +152,12 @@ def load_config() -> dict[str, Any]:
     cfg.setdefault("ops_agent", {"enabled": False})
     if os.getenv("OPS_AGENT_ENABLED") is not None:
         cfg["ops_agent"]["enabled"] = _env_bool("OPS_AGENT_ENABLED", False)
+
+    # --- Crash-recovery: adopt untracked broker holdings on startup (dedicated acct).
+    cfg.setdefault("reconcile", {})
+    cfg["reconcile"].setdefault("adopt_orphans", True)
+    if os.getenv("RECONCILE_ADOPT_ORPHANS") is not None:
+        cfg["reconcile"]["adopt_orphans"] = _env_bool("RECONCILE_ADOPT_ORPHANS", True)
 
     cfg["runtime"] = {
         "paper_trading": paper,

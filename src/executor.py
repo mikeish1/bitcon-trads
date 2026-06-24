@@ -114,6 +114,38 @@ class SpotExecutor:
             pass
         return self.min_notional
 
+    def _resolve_filled(self, order: dict[str, Any], symbol: str, requested_qty: float) -> float:
+        """Return the ACTUAL filled quantity for a just-placed order.
+
+        Original defect: callers did ``float(order.get("filled") or qty)``, which maps
+        BOTH ``None`` (venue hasn't reported the fill yet) AND ``0.0`` (rejected /
+        unfilled) to the full requested qty - so the bot books a position it does not
+        own, then places a protective stop / later sells size that isn't there (a
+        state-vs-reality desync on the money path). Here a reported ``0`` stays ``0``,
+        and an UNKNOWN (None/missing) fill is re-fetched once before we decide rather
+        than optimistically assumed."""
+        raw = order.get("filled")
+        if raw is not None:                       # venue reported a number (incl. 0.0)
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+        oid = order.get("id")
+        if oid:                                   # unknown -> ask the venue once
+            try:
+                fresh = self.exchange.fetch_order(oid, symbol)
+                if fresh.get("filled") is not None:
+                    return float(fresh["filled"])
+                order = fresh                     # use the fresh status below
+            except Exception as exc:
+                logger.warning("{} {} fill-status fetch failed ({}); treating as unfilled.",
+                               self.tag, symbol, exc)
+                return 0.0
+        # Still unknown: only trust the request size if the venue says it's done.
+        if (order.get("status") or "").lower() in ("closed", "filled"):
+            return requested_qty
+        return 0.0
+
     # ------------------------------------------------------------------ #
     def market_buy(self, symbol: str, quote_to_spend: float, price_hint: float,
                    intended_price: Optional[float] = None,
@@ -142,12 +174,17 @@ class SpotExecutor:
 
         try:
             order = self.exchange.create_market_buy_order(symbol, qty)
-            filled = float(order.get("filled") or qty)
+            # FIX: never assume a fill. A reported 0 stays 0; an unknown is resolved.
+            filled = self._resolve_filled(order, symbol, qty)
+            if filled <= 0:
+                logger.error("{} {} BUY returned no fill (status={}); NO position booked.",
+                             self.tag, symbol, order.get("status"))
+                return None                       # caller skips record_open -> no phantom position
             cost = float(order.get("cost") or (filled * price_hint))
             avg = float(order.get("average") or (cost / filled if filled else price_hint))
             fee = self._extract_fee(order)
-            self._log("{} BUY {} filled {:.6f} @ {:.4f} (cost {:.2f}, fee {:.2f})",
-                      self.tag, symbol, filled, avg, cost, fee)
+            self._log("{} BUY {} filled {:.6f}/{:.6f} @ {:.4f} (cost {:.2f}, fee {:.2f})",
+                      self.tag, symbol, filled, qty, avg, cost, fee)
             fill = {"id": order.get("id"), "qty": filled, "price": avg, "cost": cost, "fee": fee}
             return self._attach_slippage(fill, symbol, "buy", order_type, intended)
         except Exception as exc:
@@ -175,12 +212,18 @@ class SpotExecutor:
 
         try:
             order = self.exchange.create_market_sell_order(symbol, qty)
-            filled = float(order.get("filled") or qty)
+            # FIX: a reported 0/None fill must NOT be booked as a full exit, or the DB
+            # would mark the position CLOSED while the coins are still in the account.
+            filled = self._resolve_filled(order, symbol, qty)
+            if filled <= 0:
+                logger.error("{} {} SELL returned no fill (status={}); position NOT closed.",
+                             self.tag, symbol, order.get("status"))
+                return None                       # caller keeps the position OPEN and retries
             proceeds = float(order.get("cost") or (filled * price_hint))
             avg = float(order.get("average") or (proceeds / filled if filled else price_hint))
             fee = self._extract_fee(order)
-            self._log("{} SELL {} filled {:.6f} @ {:.4f} ({}) proceeds {:.2f} fee {:.2f}",
-                      self.tag, symbol, filled, avg, reason, proceeds, fee)
+            self._log("{} SELL {} filled {:.6f}/{:.6f} @ {:.4f} ({}) proceeds {:.2f} fee {:.2f}",
+                      self.tag, symbol, filled, qty, avg, reason, proceeds, fee)
             fill = {"id": order.get("id"), "qty": filled, "price": avg, "proceeds": proceeds, "fee": fee}
             return self._attach_slippage(fill, symbol, "sell", order_type, intended, reason)
         except Exception as exc:
